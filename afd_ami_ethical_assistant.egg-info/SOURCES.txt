@@ -1,0 +1,10 @@
+LICENSE
+README.md
+afd_ami_core.py
+app.py
+setup.py
+afd_ami_ethical_assistant.egg-info/PKG-INFO
+afd_ami_ethical_assistant.egg-info/SOURCES.txt
+afd_ami_ethical_assistant.egg-info/dependency_links.txt
+afd_ami_ethical_assistant.egg-info/top_level.txt
+tests/test_afd_ami.py
