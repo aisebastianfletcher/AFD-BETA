@@ -1,6 +1,18 @@
-import os
+# diagnostics: replace the import with this to show the full import error in the UI
 import streamlit as st
-from afd_ami_core import AFDInfinityAMI
+import traceback
+
+try:
+    from afd_ami_core import AFDInfinityAMI
+except Exception as e:
+    st.error("Error importing afd_ami_core.py — showing full traceback below (no secrets will be printed):")
+    st.text(str(e))
+    st.text(traceback.format_exc())
+    # stop execution so the app doesn't continue in a broken state
+    st.stop()
+
+# --- normal app code starts here ---
+import os
 
 st.set_page_config(page_title="AFD∞-AMI", layout="centered")
 
@@ -26,6 +38,8 @@ with st.expander("Debug: OpenAI key & AFD status (click to expand)"):
             st.write("AFDInfinityAMI created.")
             st.write("Using OpenAI:", bool(ami_diag.use_openai))
             st.write("Latest reflection:", ami_diag.get_latest_reflection())
+            # Show available public methods (safe introspection)
+            st.write("AFD instance methods:", [n for n in dir(ami_diag) if callable(getattr(ami_diag, n)) and not n.startswith("_")])
         except Exception as e:
             st.error("Failed to initialize AFDInfinityAMI for diagnostics.")
             st.exception(e)
@@ -58,6 +72,9 @@ if submit:
     try:
         # We pass use_openai flag to prefer OpenAI, but AFDInfinityAMI also auto-detects the key.
         ami = AFDInfinityAMI(use_openai=use_openai_checkbox)
+        # Immediately show reflection so you can see auth/init status
+        st.write("Using OpenAI:", bool(ami.use_openai))
+        st.write("Latest reflection:", ami.get_latest_reflection())
     except Exception as e:
         st.error("Failed to initialize the assistant.")
         st.exception(e)
