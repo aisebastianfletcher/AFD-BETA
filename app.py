@@ -1,75 +1,106 @@
-import streamlit as st
 import os
+import streamlit as st
 from afd_ami_core import AFDInfinityAMI
-import pandas as pd
-import matplotlib.pyplot as plt
-import time
 
-# Set page configuration
-st.set_page_config(page_title="AFD∞-AMI Ethical Assistant", layout="wide")
+st.set_page_config(page_title="AFD∞-AMI", layout="centered")
 
-# Initialize or load the AFDInfinityAMI instance
-@st.cache_resource
-def get_afd_ami():
-    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    return AFDInfinityAMI(use_openai=bool(api_key), openai_api_key=api_key)
+st.title("AFD∞-AMI — Neutralized, AFD-driven Assistant")
+st.write(
+    "This app translates user input into a neutral representation, runs the AFD mathematical "
+    "framework, and renders a neutral explanation based only on the AFD metrics and the neutral input."
+)
 
-afd_ami = get_afd_ami()
+# -------- Diagnostic / Debug (safe) ----------
+with st.expander("Debug: OpenAI key & AFD status (click to expand)"):
+    key_present = bool(st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"))
+    st.write("OPENAI_API_KEY present:", key_present)
 
-# Session state for conversation history
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-# Title and description
-st.title("AFD∞-AMI Ethical Assistant")
-st.write("A non-reward-based ethical assistant using Autonomous Fletcher Dynamics. Ask me anything ethical!")
-
-# Input prompt
-prompt = st.text_input("Enter your question:", key="prompt_input")
-
-if st.button("Submit"):
-    if prompt:
-        with st.spinner("Thinking..."):
-            time.sleep(1)  # Simulate thinking delay
-            response, coherence, reflection = afd_ami.respond(prompt)
-        
-        # Update history
-        st.session_state.history.append({"prompt": prompt, "response": response, "coherence": coherence, "reflection": reflection})
-        
-        # Display results
-        st.subheader("Response")
-        st.write(response)
-        st.write(f"**Coherence Score:** {coherence:.2f}")
-        st.write(f"**Reflection Log:** {reflection}")
-        
-        # Display coherence trend
-        st.subheader("Coherence Trend")
+    # Optional: instantiate the AFD class for diagnostics (may download HF models if OpenAI not used)
+    init_diag = st.checkbox(
+        "Initialize AFDInfinityAMI for diagnostics (may download models if OpenAI not used)",
+        value=False,
+    )
+    if init_diag:
         try:
-            df = afd_ami.load_memory()
-            if not df.empty:
-                scores = df['coherence'].tail(5).tolist()
-                fig, ax = plt.subplots()
-                ax.plot(scores, label='Coherence', color='#1f77b4')
-                ax.set_title('Ethical Coherence Trend')
-                ax.set_xlabel('Recent Interactions')
-                ax.set_ylabel('Coherence Score')
-                ax.set_ylim(0, 1)
-                ax.legend()
-                st.pyplot(fig)
-            else:
-                st.write("No trend graph available yet (empty CSV).")
+            ami_diag = AFDInfinityAMI()
+            st.write("AFDInfinityAMI created.")
+            st.write("Using OpenAI:", bool(ami_diag.use_openai))
+            st.write("Latest reflection:", ami_diag.get_latest_reflection())
         except Exception as e:
-            st.error(f"Error loading trend graph: {e}")
+            st.error("Failed to initialize AFDInfinityAMI for diagnostics.")
+            st.exception(e)
+    else:
+        st.write("Initialization skipped.")
 
-# Display conversation history
-if st.session_state.history:
-    st.subheader("Conversation History")
-    for i, entry in enumerate(reversed(st.session_state.history[-5:])):
-        with st.expander(f"Interaction {len(st.session_state.history) - i}"):
-            st.write(f"**Prompt:** {entry['prompt']}")
-            st.write(f"**Response:** {entry['response']}")
-            st.write(f"**Coherence Score:** {entry['coherence']:.2f}")
-            st.write(f"**Reflection Log:** {entry['reflection']}")
+st.markdown("---")
 
-# Footer
-st.write("© 2025 Sebastian Fletcher | CC BY-NC-ND 4.0")
+# -------- User Interaction ----------
+st.header("Ask the assistant (neutralized + AFD-driven)")
+prompt = st.text_area(
+    "Enter your question or prompt. The assistant will first neutralize it, run the AFD math, and then render a neutral explanation.",
+    value="Explain the ethical considerations of using AI in hiring decisions.",
+    height=140,
+)
+
+col1, col2 = st.columns([1, 1])
+with col1:
+    use_openai_checkbox = st.checkbox(
+        "Prefer OpenAI if available (fallback to local HF if auth or network fails)",
+        value=True,
+    )
+with col2:
+    include_memory_checkbox = st.checkbox("Show last neutralized prompt from memory", value=True)
+
+submit = st.button("Generate response")
+
+if submit:
+    # Instantiate the AFD agent when needed. Let the class detect secrets/env internally.
+    try:
+        # We pass use_openai flag to prefer OpenAI, but AFDInfinityAMI also auto-detects the key.
+        ami = AFDInfinityAMI(use_openai=use_openai_checkbox)
+    except Exception as e:
+        st.error("Failed to initialize the assistant.")
+        st.exception(e)
+    else:
+        with st.spinner("Neutralizing input and generating response..."):
+            try:
+                response, coherence, reflection = ami.respond(prompt)
+            except Exception as e:
+                st.error("An error occurred while generating the response.")
+                st.exception(e)
+                # Show any available reflection info
+                try:
+                    st.write("Latest reflection:", ami.get_latest_reflection())
+                except Exception:
+                    pass
+            else:
+                st.subheader("Response")
+                st.write(response)
+
+                st.markdown("**AFD outputs**")
+                st.write(f"- Coherence score: {coherence:.6f}")
+                st.write(f"- Latest reflection: {reflection}")
+
+                # Optionally show the neutralized prompt saved in memory for audit
+                if include_memory_checkbox:
+                    try:
+                        mem = ami.load_memory()
+                        if not mem.empty:
+                            last = mem.iloc[-1]
+                            neutral = last.get("neutral_prompt", None)
+                            if neutral:
+                                st.caption("Stored neutralized prompt (most recent):")
+                                st.write(neutral)
+                            else:
+                                st.caption("No neutralized prompt stored in memory.")
+                        else:
+                            st.caption("Memory is empty.")
+                    except Exception as e:
+                        st.warning("Could not read memory file.")
+                        st.exception(e)
+
+st.markdown("---")
+st.caption(
+    "Notes: The app will not display any API keys. If OpenAI is selected but authentication fails, "
+    "the system will automatically fall back to the local HF pipeline if available and record the reason in the reflection log."
+)
