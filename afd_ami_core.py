@@ -1,3 +1,14 @@
+"""
+AFDInfinityAMI - Revised to:
+ - Use a two-stage LLM workflow: (1) neutralizer/translator that converts user input to
+   a concise, non-biased, factual representation and (2) constrained generator that
+   produces the final textual output using ONLY the AFD-derived directives + neutral input.
+ - Keep the AFD mathematical framework (state/action/coherence/etc.) as the independent
+   decision-making core. The LLMs are restricted to (a) neutral translation and (b)
+   factual rendering based on AFD outputs.
+ - Use Streamlit secrets or environment OPENAI_API_KEY when available.
+ - Defensive handling for OpenAI and local HF pipelines.
+"""
 import os
 import numpy as np
 import pandas as pd
@@ -8,92 +19,163 @@ from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 
 class AFDInfinityAMI:
     def __init__(self, use_openai=False, openai_api_key=None):
-        self.use_openai = use_openai
+        # Allow automatic detection if an API key is present if caller sets use_openai=False
+        api_key = openai_api_key or st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.use_openai = bool(api_key) or use_openai
+        if self.use_openai and api_key:
+            openai.api_key = api_key
+
         self.memory_file = 'data/response_log.csv'
         self.alpha, self.beta, self.gamma, self.delta = 1.0, 1.0, 0.5, 0.5
         self.reflection_log = []
 
-        # Instruction prefix to encourage longer, coherent answers
-        self.instruction_prefix = (
-            "You are AFD∞-AMI Ethical Assistant. Provide a thoughtful, clear, and complete answer in full sentences. "
-            "When appropriate, briefly explain your reasoning or mention ethical considerations. Be concise but thorough."
+        # The AFD framework must be the independent decision maker.
+        # LLM usage is restricted to translating user text to a neutral form
+        # and then rendering the final explanation strictly from AFD outputs
+        # and the neutralized user input.
+        self.neutralizer_system = (
+            "You are a precise neutral translator. Convert the user's input into a short, "
+            "neutral, factual description suitable for algorithmic processing. "
+            "Do NOT add opinions, recommendations, or extra context. Keep it concise."
+        )
+        self.renderer_system = (
+            "You are a factual renderer. Produce a clear, neutral, and concise explanation "
+            "based ONLY on the provided neutral input and the AFD directives below. "
+            "Do NOT add any external opinions, extra facts, or speculation. Use full sentences."
         )
 
-        if use_openai and openai_api_key:
-            openai.api_key = openai_api_key
-            self.llm = self._openai_generate
-            self.sentiment_analyzer = self._cache_sentiment_analyzer()
-        else:
-            self.llm = self._cache_llm()
-            self.sentiment_analyzer = self._cache_sentiment_analyzer()
+        # Local model caches (transformers pipelines)
+        self._hf_llm = None
+        self._hf_neutralizer = None
+        self._hf_renderer = None
+        self.sentiment_analyzer = None
 
+        # Initialize resources
+        try:
+            self.sentiment_analyzer = self._cache_sentiment_analyzer()
+        except Exception as e:
+            # Keep going but log reflection
+            self.reflection_log.append(f"Sentiment analyzer init error: {e}")
+            self.sentiment_analyzer = None
+
+        # If not using OpenAI, cache local HF pipelines on demand
+        if not self.use_openai:
+            try:
+                self._hf_llm = self._cache_llm()
+            except Exception as e:
+                self.reflection_log.append(f"Local LLM init error: {e}")
+                self._hf_llm = None
+
+        # Ensure memory file exists
         if not os.path.exists(self.memory_file):
             try:
                 os.makedirs(os.path.dirname(self.memory_file), exist_ok=True)
-                pd.DataFrame(columns=['prompt', 'response', 'coherence']).to_csv(self.memory_file, index=False, encoding='utf-8-sig')
+                pd.DataFrame(columns=['prompt', 'neutral_prompt', 'response', 'coherence']).to_csv(self.memory_file, index=False, encoding='utf-8-sig')
             except Exception as e:
-                print(f"Error creating memory file: {e}")
+                self.reflection_log.append(f"Error creating memory file: {e}")
 
+    #
+    # Caching utilities for HF pipelines (local)
+    #
     @st.cache_resource
     def _cache_llm(_self):
-        """
-        Load tokenizer and causal LM, set pad token to eos to avoid generation errors/warnings.
-        Return a text-generation pipeline configured for the available device (GPU if available).
-        """
+        # Provide a causal LM pipeline used for neutralizer and renderer when OpenAI not available.
         model_name = "gpt2"
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModelForCausalLM.from_pretrained(model_name)
-            # Ensure tokenizer has a pad token (gpt2 does not by default)
-            if tokenizer.pad_token_id is None:
-                tokenizer.pad_token = tokenizer.eos_token
-            # Ensure model config pad token is set
-            if getattr(model.config, "pad_token_id", None) is None:
-                model.config.pad_token_id = model.config.eos_token_id
-            device = 0 if torch.cuda.is_available() else -1
-            return pipeline("text-generation", model=model, tokenizer=tokenizer, device=device)
-        except Exception as e:
-            # Fallback to a simple pipeline call; keep the error in reflections
-            _self.reflection_log.append(f"LLM cache/load error: {e}. Falling back to default pipeline construction.")
-            return pipeline("text-generation", model=model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        # ensure pad token exists
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        if getattr(model.config, "pad_token_id", None) is None:
+            model.config.pad_token_id = model.config.eos_token_id
+        device = 0 if torch.cuda.is_available() else -1
+        return pipeline("text-generation", model=model, tokenizer=tokenizer, device=device)
 
     @st.cache_resource
     def _cache_sentiment_analyzer(_self):
-        # Standard HF SST-2 fine-tuned model
+        # Standard SST-2 sentiment analyzer; used only to produce a numeric state proxy.
         return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
 
-    def _openai_generate(self, prompt, max_tokens=150, **kwargs):
-        """
-        Call OpenAI ChatCompletion with a system instruction to encourage coherent, full-sentence answers.
-        Returns a list similar to HF pipeline output: [{'generated_text': content}]
-        """
+    #
+    # LLM wrappers: neutralizer and renderer
+    #
+    def _neutralize_with_openai(self, user_input):
+        # Use a deterministic low-temperature call to translate into neutral text
         try:
             messages = [
-                {"role": "system", "content": self.instruction_prefix},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": self.neutralizer_system},
+                {"role": "user", "content": user_input}
             ]
-            response = openai.ChatCompletion.create(
+            resp = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.8,
-                top_p=0.95
+                temperature=0.0,
+                max_tokens=120
             )
-            # Robust extraction across client versions
-            content = ""
+            # robust extraction
             try:
-                content = response.choices[0].message.content
+                return resp.choices[0].message.content.strip()
             except Exception:
-                try:
-                    content = response.choices[0]['message']['content']
-                except Exception:
-                    content = response.choices[0].get('text', '')
-            return [{"generated_text": content}]
+                return resp.choices[0].get('text', '').strip()
         except Exception as e:
-            self.reflection_log.append(f"OpenAI error: {e}. Falling back to local pipeline.")
-            # Fallback to local LLM: call with compatible args
-            return self.llm(prompt, max_new_tokens=150, do_sample=True, top_k=50, top_p=0.95, temperature=0.8, num_return_sequences=1, return_full_text=False)
+            self.reflection_log.append(f"OpenAI neutralize error: {e}")
+            return ""
 
+    def _render_with_openai(self, neutral_input, afd_directives, max_tokens=250):
+        # Provide explicit instruction: use ONLY neutral_input and afd_directives to produce output.
+        content = f"Neutral input:\n{neutral_input}\n\nAFD directives:\n{afd_directives}\n\nProduce a single neutral explanation using only the above."
+        try:
+            messages = [
+                {"role": "system", "content": self.renderer_system},
+                {"role": "user", "content": content}
+            ]
+            resp = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=max_tokens
+            )
+            try:
+                return resp.choices[0].message.content.strip()
+            except Exception:
+                return resp.choices[0].get('text', '').strip()
+        except Exception as e:
+            self.reflection_log.append(f"OpenAI render error: {e}")
+            return "Unable to render response using OpenAI."
+
+    def _neutralize_with_hf(self, user_input):
+        # Use the local HF pipeline to generate a neutral short description.
+        # We keep sampling low/temperature low to avoid hallucination.
+        if self._hf_llm is None:
+            return ""
+        prompt = f"{self.neutralizer_system}\n\nUser: {user_input}\n\nNeutral:"
+        try:
+            out = self._hf_llm(prompt, max_new_tokens=80, do_sample=False, return_full_text=False, num_return_sequences=1)
+            # pipeline returns [{'generated_text': '...'}]
+            text = out[0].get('generated_text', '') if isinstance(out[0], dict) else str(out[0])
+            return text.strip()
+        except Exception as e:
+            self.reflection_log.append(f"HF neutralize error: {e}")
+            return ""
+
+    def _render_with_hf(self, neutral_input, afd_directives):
+        if self._hf_llm is None:
+            return "Local model not available to render."
+        prompt = f"{self.renderer_system}\n\nNeutral input:\n{neutral_input}\n\nAFD directives:\n{afd_directives}\n\nAnswer:"
+        try:
+            out = self._hf_llm(prompt, max_new_tokens=220, do_sample=True, top_k=40, top_p=0.9, temperature=0.6, return_full_text=False, num_return_sequences=1)
+            text = out[0].get('generated_text', '') if isinstance(out[0], dict) else str(out[0])
+            # strip any echo of the prompt if present
+            if text.startswith(prompt):
+                text = text[len(prompt):]
+            return text.strip()
+        except Exception as e:
+            self.reflection_log.append(f"HF render error: {e}")
+            return "Unable to render response locally."
+
+    #
+    # AFD framework (unchanged core computations)
+    #
     def predict_next_state(self, state, action):
         return state + np.random.normal(0, 0.1, state.shape)
 
@@ -120,23 +202,31 @@ class AFDInfinityAMI:
         phi = self.compute_potential(s_prime)
 
         score = self.alpha * h + self.beta * i - self.gamma * o + self.delta * phi
-        return score, {'harmony': h, 'info_gradient': i, 'oscillation': o, 'potential': phi}
+        return float(score), {'harmony': float(h), 'info_gradient': float(i), 'oscillation': float(o), 'potential': float(phi)}
 
     def adjust_coefficients(self, coherence, metrics):
-        log = f"Coherence: {coherence:.2f}, Metrics: {metrics}"
+        log = f"Coherence: {coherence:.4f}, Metrics: {metrics}"
         if coherence < 0.5:
-            self.alpha += 0.1
+            self.alpha += 0.05
             self.reflection_log.append(f"Increased alpha to {self.alpha:.2f} for better harmony. {log}")
         elif coherence > 0.9:
-            self.gamma += 0.1
+            self.gamma += 0.05
             self.reflection_log.append(f"Increased gamma to {self.gamma:.2f} to reduce oscillation. {log}")
         else:
             self.reflection_log.append(f"No adjustment needed. {log}")
 
-    def save_memory(self, prompt, response, coherence):
+    #
+    # Memory I/O
+    #
+    def save_memory(self, prompt, neutral_prompt, response, coherence):
         try:
             df = pd.read_csv(self.memory_file, encoding='utf-8-sig')
-            new_row = pd.DataFrame({'prompt': [prompt], 'response': [response], 'coherence': [coherence]})
+            new_row = pd.DataFrame({
+                'prompt': [prompt],
+                'neutral_prompt': [neutral_prompt],
+                'response': [response],
+                'coherence': [coherence]
+            })
             df = pd.concat([df, new_row], ignore_index=True)
             df.to_csv(self.memory_file, index=False, encoding='utf-8-sig')
         except Exception as e:
@@ -146,81 +236,68 @@ class AFDInfinityAMI:
         try:
             return pd.read_csv(self.memory_file, encoding='utf-8-sig')
         except Exception as e:
-            print(f"Error loading memory file: {e}")
-            return pd.DataFrame(columns=['prompt', 'response', 'coherence'])
+            self.reflection_log.append(f"Error loading memory file: {e}")
+            return pd.DataFrame(columns=['prompt', 'neutral_prompt', 'response', 'coherence'])
 
     def get_latest_reflection(self):
         return self.reflection_log[-1] if self.reflection_log else "No reflections yet."
 
+    #
+    # High-level respond() that enforces the neutral-then-AFD-then-render flow
+    #
     def respond(self, prompt):
-        memory = self.load_memory()
-        past_response = ""
-        if not memory.empty:
-            try:
-                similar = memory[memory['prompt'].str.contains(prompt[:20], case=False, na=False)]
-                if not similar.empty:
-                    best = similar.loc[similar['coherence'].idxmax()]
-                    past_response = f"Past high-coherence response: {best['response']} (Coherence: {best['coherence']:.2f})"
-            except Exception:
-                # If the contains search fails for any reason, ignore it gracefully
-                pass
-
-        # Compose prompt with instruction prefix
-        full_prompt = f"{self.instruction_prefix}\n\nUser: {prompt}"
-        if past_response:
-            full_prompt += f"\n\nContext: {past_response}"
-
-        # Choose generation path
+        # 1) Neutralize / translate the prompt
+        neutral_prompt = ""
         if self.use_openai:
-            # Let OpenAI generate up to 150 tokens by default (increase if you want longer answers)
-            result = self.llm(full_prompt, max_tokens=150)
-            raw_response = result[0].get('generated_text', '')
+            neutral_prompt = self._neutralize_with_openai(prompt)
         else:
-            # For transformers pipeline use modern args (max_new_tokens) and sampling parameters
-            try:
-                result = self.llm(
-                    full_prompt,
-                    max_new_tokens=150,
-                    do_sample=True,
-                    top_k=50,
-                    top_p=0.95,
-                    temperature=0.8,
-                    num_return_sequences=1,
-                    return_full_text=False
-                )
-                # pipeline returns list of dicts with 'generated_text'
-                raw_response = result[0].get('generated_text', '') if isinstance(result[0], dict) else str(result[0])
-            except TypeError:
-                # Older transformers may not support max_new_tokens; fall back to max_length
-                result = self.llm(
-                    full_prompt,
-                    max_length=200,
-                    do_sample=True,
-                    top_k=50,
-                    top_p=0.95,
-                    temperature=0.8,
-                    num_return_sequences=1,
-                    return_full_text=False
-                )
-                raw_response = result[0].get('generated_text', '') if isinstance(result[0], dict) else str(result[0])
-            except Exception as e:
-                self.reflection_log.append(f"Local generation error: {e}")
-                raw_response = "I'm sorry, I couldn't generate a response right now."
+            neutral_prompt = self._neutralize_with_hf(prompt)
 
-        # Post-process: strip any repeated prompt text if returned
-        if isinstance(raw_response, str) and full_prompt.strip() and raw_response.startswith(full_prompt.strip()):
-            raw_response = raw_response[len(full_prompt):].strip()
+        if not neutral_prompt:
+            # fallback: stripped user prompt but flagged as non-neutralized
+            neutral_prompt = prompt.strip()
 
-        # Sentiment analysis (fallback to neutral on error)
+        # 2) Compute sentiment/state from neutral prompt to drive AFD math.
         try:
-            sentiment = self.sentiment_analyzer(raw_response)[0]
+            if self.sentiment_analyzer:
+                sent = self.sentiment_analyzer(neutral_prompt)[0]
+                sentiment_score = float(sent.get('score', 0.5))
+                sentiment_label = sent.get('label', 'NEUTRAL')
+            else:
+                sentiment_score = 0.5
+                sentiment_label = 'NEUTRAL'
         except Exception as e:
-            self.reflection_log.append(f"Sentiment analyzer error: {e}")
-            sentiment = {'label': 'NEUTRAL', 'score': 0.5}
+            self.reflection_log.append(f"Sentiment error in respond: {e}")
+            sentiment_score = 0.5
+            sentiment_label = 'NEUTRAL'
 
-        state = np.array([sentiment.get('score', 0.5)] * 5)
-        action = np.array([1 if sentiment.get('label', '').upper().startswith('POS') else -1] * 5)
+        # Construct numeric state and action for AFD computations
+        state = np.array([sentiment_score] * 5)
+        action = np.array([1 if str(sentiment_label).upper().startswith('POS') else -1] * 5)
+
+        # 3) Compute coherence and other AFD metrics (this is the independent core)
         coherence, metrics = self.coherence_score(action, state)
+        # Adjust coefficients according to the AFD framework
         self.adjust_coefficients(coherence, metrics)
-        self.save_memory(prompt, raw_response, coherence)
-        return raw_response, coherence, self.get_latest_reflection()
+
+        # 4) Craft AFD directives (structured, numeric, non-opinionated) to send to renderer
+        afd_directives = (
+            f"AFD metrics:\n"
+            f"- coherence: {coherence:.6f}\n"
+            f"- harmony: {metrics.get('harmony'):.6f}\n"
+            f"- info_gradient: {metrics.get('info_gradient'):.6f}\n"
+            f"- oscillation: {metrics.get('oscillation'):.6f}\n"
+            f"- potential: {metrics.get('potential'):.6f}\n"
+            f"Coefficients: alpha={self.alpha:.3f}, beta={self.beta:.3f}, gamma={self.gamma:.3f}, delta={self.delta:.3f}\n"
+            "The renderer must use ONLY the neutral input and the numeric AFD metrics above to construct the response."
+        )
+
+        # 5) Render final text using OpenAI or HF pipeline but constrained to afd_directives + neutral_prompt
+        if self.use_openai:
+            final_text = self._render_with_openai(neutral_prompt, afd_directives)
+        else:
+            final_text = self._render_with_hf(neutral_prompt, afd_directives)
+
+        # 6) Save to memory and return
+        self.save_memory(prompt, neutral_prompt, final_text, coherence)
+        return final_text, coherence, self.get_latest_reflection()
