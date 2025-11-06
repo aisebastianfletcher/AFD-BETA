@@ -29,11 +29,13 @@ class AFDInfinityAMI:
 
     @st.cache_resource
     def _cache_llm(_self):  # Changed self to _self
+        # Use a small generative model by default; pipeline will handle download
         return pipeline("text-generation", model="gpt2")
 
     @st.cache_resource
     def _cache_sentiment_analyzer(_self):  # Changed self to _self
-        return pipeline("sentiment-analysis", model="distilbert/distilbert-base-uncased-finetuned-sst-2-english")
+        # Use the standard HF model name for SST-2 sentiment
+        return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
 
     def _openai_generate(self, prompt, max_length=50, truncation=True, num_return_sequences=1, **kwargs):
         try:
@@ -44,10 +46,21 @@ class AFDInfinityAMI:
                 temperature=0.7,
                 top_p=0.9
             )
-            return [{"generated_text": response.choices[0].message.content}]
+            # Extract content robustly across versions/response shapes
+            content = ""
+            try:
+                content = response.choices[0].message.content
+            except Exception:
+                try:
+                    content = response.choices[0]['message']['content']
+                except Exception:
+                    content = response.choices[0].get('text', '')
+            return [{"generated_text": content}]
         except Exception as e:
             self.reflection_log.append(f"OpenAI error: {e}. Falling back to GPT-2.")
-            return self.llm(prompt, max_length=max_length, truncation=truncation, num_return_sequences=num_return_sequences, **kwargs)
+            # Fallback to local llm (transformers pipeline)
+            # Call the pipeline with parameters compatible with it
+            return self.llm(prompt, max_length=max_length, num_return_sequences=num_return_sequences, temperature=0.7, top_p=0.9)
 
     def predict_next_state(self, state, action):
         return state + np.random.normal(0, 0.1, state.shape)
@@ -116,18 +129,38 @@ class AFDInfinityAMI:
                 best = similar.loc[similar['coherence'].idxmax()]
                 past_response = f"Past high-coherence response: {best['response']} (Coherence: {best['coherence']:.2f})"
         
-        raw_response = self.llm(
-            prompt + (f"\n\n{past_response}" if past_response else ""),
-            max_length=50,
-            truncation=True,
-            num_return_sequences=1,
-            temperature=0.7,
-            top_p=0.9
-        )[0]['generated_text']
-        
-        sentiment = self.sentiment_analyzer(raw_response)[0]
-        state = np.array([sentiment['score']] * 5)
-        action = np.array([1 if sentiment['label'] == 'POSITIVE' else -1] * 5)
+        full_prompt = prompt + (f"\n\n{past_response}" if past_response else "")
+
+        # Prepare kwargs depending on whether we're using OpenAI or the local transformers pipeline
+        if self.use_openai:
+            # OpenAI wrapper accepts max_tokens etc. _openai_generate handles the call
+            result = self.llm(full_prompt, max_length=50, truncation=True, num_return_sequences=1, temperature=0.7, top_p=0.9)
+        else:
+            # Transformers text-generation pipeline expects generate-compatible args;
+            # 'truncation' is not a valid generation arg and can cause ValueError, so we omit it
+            # Use do_sample=True when num_return_sequences > 1 or when sampling is desired
+            result = self.llm(
+                full_prompt,
+                max_length=50,
+                do_sample=True,
+                num_return_sequences=1,
+                temperature=0.7,
+                top_p=0.9,
+                return_full_text=False
+            )
+
+        raw_response = result[0].get('generated_text', '') if isinstance(result[0], dict) else str(result[0])
+
+        # Sentiment
+        try:
+            sentiment = self.sentiment_analyzer(raw_response)[0]
+        except Exception as e:
+            # In case sentiment analyzer fails, default to neutral
+            self.reflection_log.append(f"Sentiment analyzer error: {e}")
+            sentiment = {'label': 'NEUTRAL', 'score': 0.5}
+
+        state = np.array([sentiment.get('score', 0.5)] * 5)
+        action = np.array([1 if sentiment.get('label', '').upper().startswith('POS') else -1] * 5)
         coherence, metrics = self.coherence_score(action, state)
         self.adjust_coefficients(coherence, metrics)
         self.save_memory(prompt, raw_response, coherence)
