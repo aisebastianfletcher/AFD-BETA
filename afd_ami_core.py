@@ -28,30 +28,26 @@ class AFDInfinityAMI:
                 print(f"Error creating memory file: {e}")
 
     @st.cache_resource
-    def _cache_llm(_self):
+    def _cache_llm(_self):  # Changed self to _self
         return pipeline("text-generation", model="gpt2")
 
     @st.cache_resource
-    def _cache_sentiment_analyzer(_self):
+    def _cache_sentiment_analyzer(_self):  # Changed self to _self
         return pipeline("sentiment-analysis", model="distilbert/distilbert-base-uncased-finetuned-sst-2-english")
 
-    def _openai_generate(self, prompt, max_length=50, num_return_sequences=1, **kwargs):
+    def _openai_generate(self, prompt, max_length=50, truncation=True, num_return_sequences=1, **kwargs):
         try:
             response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_length
+                max_tokens=max_length,
+                temperature=0.7,
+                top_p=0.9
             )
             return [{"generated_text": response.choices[0].message.content}]
         except Exception as e:
             self.reflection_log.append(f"OpenAI error: {e}. Falling back to GPT-2.")
-            return self._cache_llm()(
-                prompt,
-                max_length=max_length,
-                num_return_sequences=num_return_sequences,
-                do_sample=True,
-                **kwargs
-            )
+            return self.llm(prompt, max_length=max_length, truncation=truncation, num_return_sequences=num_return_sequences, **kwargs)
 
     def predict_next_state(self, state, action):
         return state + np.random.normal(0, 0.1, state.shape)
@@ -94,14 +90,10 @@ class AFDInfinityAMI:
 
     def save_memory(self, prompt, response, coherence):
         try:
-            if not os.path.exists(self.memory_file) or os.path.getsize(self.memory_file) == 0:
-                # Create file with headers if missing or empty
-                df = pd.DataFrame(columns=['prompt', 'response', 'coherence'])
-            else:
-                df = pd.read_csv(self.memory_file, encoding='utf-8-sig')
-                new_row = pd.DataFrame({'prompt': [prompt], 'response': [response], 'coherence': [coherence]})
-                df = pd.concat([df, new_row], ignore_index=True)
-                df.to_csv(self.memory_file, index=False, encoding='utf-8-sig')
+            df = pd.read_csv(self.memory_file, encoding='utf-8-sig')
+            new_row = pd.DataFrame({'prompt': [prompt], 'response': [response], 'coherence': [coherence]})
+            df = pd.concat([df, new_row], ignore_index=True)
+            df.to_csv(self.memory_file, index=False, encoding='utf-8-sig')
         except Exception as e:
             self.reflection_log.append(f"Warning: Could not save to CSV ({e}).")
 
@@ -127,7 +119,10 @@ class AFDInfinityAMI:
         raw_response = self.llm(
             prompt + (f"\n\n{past_response}" if past_response else ""),
             max_length=50,
-            num_return_sequences=1
+            truncation=True,
+            num_return_sequences=1,
+            temperature=0.7,
+            top_p=0.9
         )[0]['generated_text']
         
         sentiment = self.sentiment_analyzer(raw_response)[0]
