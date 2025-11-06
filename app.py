@@ -28,61 +28,48 @@ st.write("A non-reward-based ethical assistant using Autonomous Fletcher Dynamic
 prompt = st.text_input("Enter your question:", key="prompt_input")
 
 if st.button("Submit"):
-    prompt = prompt.strip()
     if prompt:
         with st.spinner("Thinking..."):
-            try:
-                time.sleep(1)  # Simulate thinking delay
-                response, coherence, reflection = afd_ami.respond(prompt)
-
-                # Update history
-                st.session_state.history.append({
-                    "prompt": prompt,
-                    "response": response,
-                    "coherence": coherence,
-                    "reflection": reflection
-                })
-
-                # Display results
-                st.subheader("Response")
-                st.write(response)
-                st.markdown(f"**Coherence Score:** `{coherence:.2f}`")
-                st.markdown(f"**Reflection Log:** `{reflection}`")
-
-            except Exception as e:
-                st.error(f"Error generating response: {e}")
-    else:
-        st.warning("Please enter a valid prompt.")
-
-    # Display coherence trend
-    st.subheader("Coherence Trend")
-    try:
-        df = afd_ami.load_memory()
-        if not df.empty and 'coherence' in df:
-            scores = df['coherence'].tail(5).tolist()
-            fig, ax = plt.subplots()
-            ax.plot(scores, marker='o', linestyle='-', label='Coherence', color='#1f77b4')
-            ax.set_title('Ethical Coherence Trend')
-            ax.set_xlabel('Recent Interactions')
-            ax.set_ylabel('Coherence Score')
-            ax.set_ylim(0, 1)
-            ax.grid(True)
-            ax.legend()
-            st.pyplot(fig)
-        else:
-            st.info("No trend graph available yet.")
-    except Exception as e:
-        st.error(f"Error loading trend graph: {e}")
+            time.sleep(1)  # Simulate thinking delay
+            response, coherence, reflection = afd_ami.respond(prompt)
+        
+        # Update history
+        st.session_state.history.append({"prompt": prompt, "response": response, "coherence": coherence, "reflection": reflection})
+        
+        # Display results
+        st.subheader("Response")
+        st.write(response)
+        st.write(f"**Coherence Score:** {coherence:.2f}")
+        st.write(f"**Reflection Log:** {reflection}")
+        
+        # Display coherence trend
+        st.subheader("Coherence Trend")
+        try:
+            df = afd_ami.load_memory()
+            if not df.empty:
+                scores = df['coherence'].tail(5).tolist()
+                fig, ax = plt.subplots()
+                ax.plot(scores, label='Coherence', color='#1f77b4')
+                ax.set_title('Ethical Coherence Trend')
+                ax.set_xlabel('Recent Interactions')
+                ax.set_ylabel('Coherence Score')
+                ax.set_ylim(0, 1)
+                ax.legend()
+                st.pyplot(fig)
+            else:
+                st.write("No trend graph available yet (empty CSV).")
+        except Exception as e:
+            st.error(f"Error loading trend graph: {e}")
 
 # Display conversation history
 if st.session_state.history:
     st.subheader("Conversation History")
     for i, entry in enumerate(reversed(st.session_state.history[-5:])):
         with st.expander(f"Interaction {len(st.session_state.history) - i}"):
-            st.markdown(f"**Prompt:** {entry['prompt']}")
-            st.markdown(f"**Response:** {entry['response']}")
-            st.markdown(f"**Coherence Score:** `{entry['coherence']:.2f}`")
-            st.markdown(f"**Reflection Log:** `{entry['reflection']}`")
+            st.write(f"**Prompt:** {entry['prompt']}")
+            st.write(f"**Response:** {entry['response']}")
+            st.write(f"**Coherence Score:** {entry['coherence']:.2f}")
+            st.write(f"**Reflection Log:** {entry['reflection']}")
 
 # Footer
 st.write("© 2025 Sebastian Fletcher | CC BY-NC-ND 4.0")
