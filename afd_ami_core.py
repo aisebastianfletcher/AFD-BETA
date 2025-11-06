@@ -1,11 +1,12 @@
 """
 AFDInfinityAMI - AFD-driven assistant core.
 
-Notes:
-- Reads OPENAI_API_KEY from Streamlit secrets or environment.
-- Normalizes the key and performs a lightweight auth test on init.
-- Falls back to local HF pipeline automatically on auth failure.
-- Enforces neutralize (translate) -> AFD math -> render flow.
+Features:
+- Neutralizer (translator) -> AFD math -> Renderer pattern.
+- Robust OpenAI key normalization and lightweight auth test.
+- Automatic fallback to local Hugging Face pipeline on auth failure.
+- Lazy (on-demand) initialization of heavy HF resources to avoid blocking imports/deploys.
+- Reflection log to surface auth/init errors and behavior.
 """
 import os
 import numpy as np
@@ -27,33 +28,34 @@ class AFDInfinityAMI:
         # Read key from explicit param, Streamlit secrets, or environment
         raw_key = openai_api_key or None
         try:
-            # st.secrets may not exist in some contexts; guard it
             if raw_key is None:
                 raw_key = st.secrets.get("OPENAI_API_KEY") or raw_key
         except Exception:
+            # st.secrets may not exist in some contexts
             raw_key = raw_key
 
         if raw_key is None:
             raw_key = os.getenv("OPENAI_API_KEY")
 
-        # Normalize the key (strip spaces/quotes)
+        # Normalize the key (strip whitespace and accidental quotes)
         api_key = None
         if raw_key:
             api_key = str(raw_key).strip()
             if (api_key.startswith('"') and api_key.endswith('"')) or (api_key.startswith("'") and api_key.endswith("'")):
                 api_key = api_key[1:-1].strip()
 
-        # Set initial use_openai based on presence; we'll verify auth
+        # Set initial preference; will verify auth below
         self.use_openai = bool(api_key) or use_openai
         if api_key:
             openai.api_key = api_key
 
-        # Immediate test of OpenAI key; record reflections
+        # Reflection log collects init/runtime notes (safe to display)
         self.reflection_log = []
+
+        # If an API key is present, do a lightweight auth test and disable OpenAI on auth failure
         if self.use_openai and api_key:
             try:
                 self._test_openai_key()
-                # success -> keep use_openai True
                 self.reflection_log.append("OpenAI key test succeeded.")
             except OpenAIAuthError as e:
                 self.use_openai = False
@@ -66,7 +68,7 @@ class AFDInfinityAMI:
         self.memory_file = "data/response_log.csv"
         self.alpha, self.beta, self.gamma, self.delta = 1.0, 1.0, 0.5, 0.5
 
-        # Systems prompts for LLMs
+        # System prompts for neutralizer and renderer
         self.neutralizer_system = (
             "You are a precise neutral translator. Convert the user's input into a short, "
             "neutral, factual description suitable for algorithmic processing. "
@@ -78,26 +80,11 @@ class AFDInfinityAMI:
             "Do NOT add any external opinions, extra facts, or speculation. Use full sentences."
         )
 
-        # Local model caches (transformers pipelines)
+        # Lazy-loaded HF resources (do not initialize heavy models here)
         self._hf_llm = None
         self.sentiment_analyzer = None
 
-        # Initialize sentiment analyzer (HF) if possible
-        try:
-            self.sentiment_analyzer = self._cache_sentiment_analyzer()
-        except Exception as e:
-            self.reflection_log.append(f"Sentiment analyzer init error: {e}")
-            self.sentiment_analyzer = None
-
-        # If not using OpenAI, cache local HF pipelines on demand
-        if not self.use_openai:
-            try:
-                self._hf_llm = self._cache_llm()
-            except Exception as e:
-                self.reflection_log.append(f"Local LLM init error: {e}")
-                self._hf_llm = None
-
-        # Ensure memory file exists
+        # Ensure memory file exists (safe, non-blocking)
         if not os.path.exists(self.memory_file):
             try:
                 os.makedirs(os.path.dirname(self.memory_file), exist_ok=True)
@@ -112,7 +99,7 @@ class AFDInfinityAMI:
         Lightweight OpenAI key test: perform a minimal ChatCompletion call.
         Raises OpenAIAuthError on invalid key.
         """
-        # Small, cheap call
+        # Small, cheap call to validate auth (minimal tokens)
         resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": "Ping for auth test. Reply with 'ok'."}],
@@ -122,11 +109,33 @@ class AFDInfinityAMI:
         return True
 
     #
+    # Lazy initializers to avoid heavy downloads at import time
+    #
+    def _ensure_sentiment_analyzer(self):
+        if self.sentiment_analyzer is None:
+            try:
+                self.sentiment_analyzer = self._cache_sentiment_analyzer()
+            except Exception as e:
+                self.reflection_log.append(f"Could not init sentiment analyzer: {e}")
+                self.sentiment_analyzer = None
+        return self.sentiment_analyzer
+
+    def _ensure_hf_llm(self):
+        if self._hf_llm is None:
+            try:
+                self._hf_llm = self._cache_llm()
+            except Exception as e:
+                self.reflection_log.append(f"Could not init HF llm: {e}")
+                self._hf_llm = None
+        return self._hf_llm
+
+    #
     # Caching utilities for HF pipelines (local)
     #
     @st.cache_resource
     def _cache_llm(_self):
-        model_name = "gpt2"
+        # Use a smaller causal model by default to reduce footprint; change if you prefer
+        model_name = "distilgpt2"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(model_name)
         # ensure pad token exists
@@ -160,11 +169,7 @@ class AFDInfinityAMI:
             # Auth error: disable OpenAI and fall back to HF
             self.reflection_log.append(f"OpenAI neutralize auth error: {e}. Falling back to HF.")
             self.use_openai = False
-            if self._hf_llm is None:
-                try:
-                    self._hf_llm = self._cache_llm()
-                except Exception as e2:
-                    self.reflection_log.append(f"Failed to init HF after OpenAI auth fail: {e2}")
+            self._ensure_hf_llm()
             return self._neutralize_with_hf(user_input)
         except Exception as e:
             self.reflection_log.append(f"OpenAI neutralize error: {e}")
@@ -185,22 +190,20 @@ class AFDInfinityAMI:
         except OpenAIAuthError as e:
             self.reflection_log.append(f"OpenAI render auth error: {e}. Falling back to HF.")
             self.use_openai = False
-            if self._hf_llm is None:
-                try:
-                    self._hf_llm = self._cache_llm()
-                except Exception as e2:
-                    self.reflection_log.append(f"Failed to init HF after OpenAI auth fail: {e2}")
+            self._ensure_hf_llm()
             return self._render_with_hf(neutral_input, afd_directives)
         except Exception as e:
             self.reflection_log.append(f"OpenAI render error: {e}")
             return "Unable to render response using OpenAI."
 
     def _neutralize_with_hf(self, user_input):
-        if self._hf_llm is None:
+        llm = self._ensure_hf_llm()
+        if llm is None:
+            self.reflection_log.append("HF neutralizer not available (llm init failed).")
             return ""
         prompt = f"{self.neutralizer_system}\n\nUser: {user_input}\n\nNeutral:"
         try:
-            out = self._hf_llm(prompt, max_new_tokens=80, do_sample=False, return_full_text=False, num_return_sequences=1)
+            out = llm(prompt, max_new_tokens=80, do_sample=False, return_full_text=False, num_return_sequences=1)
             text = out[0].get("generated_text", "") if isinstance(out[0], dict) else str(out[0])
             return text.strip()
         except Exception as e:
@@ -208,11 +211,12 @@ class AFDInfinityAMI:
             return ""
 
     def _render_with_hf(self, neutral_input, afd_directives):
-        if self._hf_llm is None:
+        llm = self._ensure_hf_llm()
+        if llm is None:
             return "Local model not available to render."
         prompt = f"{self.renderer_system}\n\nNeutral input:\n{neutral_input}\n\nAFD directives:\n{afd_directives}\n\nAnswer:"
         try:
-            out = self._hf_llm(
+            out = llm(
                 prompt,
                 max_new_tokens=220,
                 do_sample=True,
@@ -313,8 +317,9 @@ class AFDInfinityAMI:
 
         # 2) Compute sentiment/state from neutral prompt to drive AFD math.
         try:
-            if self.sentiment_analyzer:
-                sent = self.sentiment_analyzer(neutral_prompt)[0]
+            sent_an = self._ensure_sentiment_analyzer()
+            if sent_an:
+                sent = sent_an(neutral_prompt)[0]
                 sentiment_score = float(sent.get("score", 0.5))
                 sentiment_label = sent.get("label", "NEUTRAL")
             else:
