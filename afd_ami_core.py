@@ -1,9 +1,10 @@
+import os
 import numpy as np
 import pandas as pd
-from transformers import pipeline
-import os
-import openai
 import streamlit as st
+import openai
+import torch
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 
 class AFDInfinityAMI:
     def __init__(self, use_openai=False, openai_api_key=None):
@@ -11,7 +12,13 @@ class AFDInfinityAMI:
         self.memory_file = 'data/response_log.csv'
         self.alpha, self.beta, self.gamma, self.delta = 1.0, 1.0, 0.5, 0.5
         self.reflection_log = []
-        
+
+        # Instruction prefix to encourage longer, coherent answers
+        self.instruction_prefix = (
+            "You are AFD∞-AMI Ethical Assistant. Provide a thoughtful, clear, and complete answer in full sentences. "
+            "When appropriate, briefly explain your reasoning or mention ethical considerations. Be concise but thorough."
+        )
+
         if use_openai and openai_api_key:
             openai.api_key = openai_api_key
             self.llm = self._openai_generate
@@ -19,7 +26,7 @@ class AFDInfinityAMI:
         else:
             self.llm = self._cache_llm()
             self.sentiment_analyzer = self._cache_sentiment_analyzer()
-        
+
         if not os.path.exists(self.memory_file):
             try:
                 os.makedirs(os.path.dirname(self.memory_file), exist_ok=True)
@@ -28,25 +35,51 @@ class AFDInfinityAMI:
                 print(f"Error creating memory file: {e}")
 
     @st.cache_resource
-    def _cache_llm(_self):  # Changed self to _self
-        # Use a small generative model by default; pipeline will handle download
-        return pipeline("text-generation", model="gpt2")
+    def _cache_llm(_self):
+        """
+        Load tokenizer and causal LM, set pad token to eos to avoid generation errors/warnings.
+        Return a text-generation pipeline configured for the available device (GPU if available).
+        """
+        model_name = "gpt2"
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name)
+            # Ensure tokenizer has a pad token (gpt2 does not by default)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            # Ensure model config pad token is set
+            if getattr(model.config, "pad_token_id", None) is None:
+                model.config.pad_token_id = model.config.eos_token_id
+            device = 0 if torch.cuda.is_available() else -1
+            return pipeline("text-generation", model=model, tokenizer=tokenizer, device=device)
+        except Exception as e:
+            # Fallback to a simple pipeline call; keep the error in reflections
+            _self.reflection_log.append(f"LLM cache/load error: {e}. Falling back to default pipeline construction.")
+            return pipeline("text-generation", model=model_name)
 
     @st.cache_resource
-    def _cache_sentiment_analyzer(_self):  # Changed self to _self
-        # Use the standard HF model name for SST-2 sentiment
+    def _cache_sentiment_analyzer(_self):
+        # Standard HF SST-2 fine-tuned model
         return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
 
-    def _openai_generate(self, prompt, max_length=50, truncation=True, num_return_sequences=1, **kwargs):
+    def _openai_generate(self, prompt, max_tokens=150, **kwargs):
+        """
+        Call OpenAI ChatCompletion with a system instruction to encourage coherent, full-sentence answers.
+        Returns a list similar to HF pipeline output: [{'generated_text': content}]
+        """
         try:
+            messages = [
+                {"role": "system", "content": self.instruction_prefix},
+                {"role": "user", "content": prompt}
+            ]
             response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_length,
-                temperature=0.7,
-                top_p=0.9
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.8,
+                top_p=0.95
             )
-            # Extract content robustly across versions/response shapes
+            # Robust extraction across client versions
             content = ""
             try:
                 content = response.choices[0].message.content
@@ -57,10 +90,9 @@ class AFDInfinityAMI:
                     content = response.choices[0].get('text', '')
             return [{"generated_text": content}]
         except Exception as e:
-            self.reflection_log.append(f"OpenAI error: {e}. Falling back to GPT-2.")
-            # Fallback to local llm (transformers pipeline)
-            # Call the pipeline with parameters compatible with it
-            return self.llm(prompt, max_length=max_length, num_return_sequences=num_return_sequences, temperature=0.7, top_p=0.9)
+            self.reflection_log.append(f"OpenAI error: {e}. Falling back to local pipeline.")
+            # Fallback to local LLM: call with compatible args
+            return self.llm(prompt, max_new_tokens=150, do_sample=True, top_k=50, top_p=0.95, temperature=0.8, num_return_sequences=1, return_full_text=False)
 
     def predict_next_state(self, state, action):
         return state + np.random.normal(0, 0.1, state.shape)
@@ -81,12 +113,12 @@ class AFDInfinityAMI:
         s_prime = self.predict_next_state(state, action)
         t = 0.5
         interp_s = state + t * (s_prime - state)
-        
+
         h = self.compute_harmony(state, interp_s)
         i = self.compute_info_gradient(state, interp_s)
         o = self.compute_oscillation(state, interp_s)
         phi = self.compute_potential(s_prime)
-        
+
         score = self.alpha * h + self.beta * i - self.gamma * o + self.delta * phi
         return score, {'harmony': h, 'info_gradient': i, 'oscillation': o, 'potential': phi}
 
@@ -124,38 +156,65 @@ class AFDInfinityAMI:
         memory = self.load_memory()
         past_response = ""
         if not memory.empty:
-            similar = memory[memory['prompt'].str.contains(prompt[:20], case=False, na=False)]
-            if not similar.empty:
-                best = similar.loc[similar['coherence'].idxmax()]
-                past_response = f"Past high-coherence response: {best['response']} (Coherence: {best['coherence']:.2f})"
-        
-        full_prompt = prompt + (f"\n\n{past_response}" if past_response else "")
+            try:
+                similar = memory[memory['prompt'].str.contains(prompt[:20], case=False, na=False)]
+                if not similar.empty:
+                    best = similar.loc[similar['coherence'].idxmax()]
+                    past_response = f"Past high-coherence response: {best['response']} (Coherence: {best['coherence']:.2f})"
+            except Exception:
+                # If the contains search fails for any reason, ignore it gracefully
+                pass
 
-        # Prepare kwargs depending on whether we're using OpenAI or the local transformers pipeline
+        # Compose prompt with instruction prefix
+        full_prompt = f"{self.instruction_prefix}\n\nUser: {prompt}"
+        if past_response:
+            full_prompt += f"\n\nContext: {past_response}"
+
+        # Choose generation path
         if self.use_openai:
-            # OpenAI wrapper accepts max_tokens etc. _openai_generate handles the call
-            result = self.llm(full_prompt, max_length=50, truncation=True, num_return_sequences=1, temperature=0.7, top_p=0.9)
+            # Let OpenAI generate up to 150 tokens by default (increase if you want longer answers)
+            result = self.llm(full_prompt, max_tokens=150)
+            raw_response = result[0].get('generated_text', '')
         else:
-            # Transformers text-generation pipeline expects generate-compatible args;
-            # 'truncation' is not a valid generation arg and can cause ValueError, so we omit it
-            # Use do_sample=True when num_return_sequences > 1 or when sampling is desired
-            result = self.llm(
-                full_prompt,
-                max_length=50,
-                do_sample=True,
-                num_return_sequences=1,
-                temperature=0.7,
-                top_p=0.9,
-                return_full_text=False
-            )
+            # For transformers pipeline use modern args (max_new_tokens) and sampling parameters
+            try:
+                result = self.llm(
+                    full_prompt,
+                    max_new_tokens=150,
+                    do_sample=True,
+                    top_k=50,
+                    top_p=0.95,
+                    temperature=0.8,
+                    num_return_sequences=1,
+                    return_full_text=False
+                )
+                # pipeline returns list of dicts with 'generated_text'
+                raw_response = result[0].get('generated_text', '') if isinstance(result[0], dict) else str(result[0])
+            except TypeError:
+                # Older transformers may not support max_new_tokens; fall back to max_length
+                result = self.llm(
+                    full_prompt,
+                    max_length=200,
+                    do_sample=True,
+                    top_k=50,
+                    top_p=0.95,
+                    temperature=0.8,
+                    num_return_sequences=1,
+                    return_full_text=False
+                )
+                raw_response = result[0].get('generated_text', '') if isinstance(result[0], dict) else str(result[0])
+            except Exception as e:
+                self.reflection_log.append(f"Local generation error: {e}")
+                raw_response = "I'm sorry, I couldn't generate a response right now."
 
-        raw_response = result[0].get('generated_text', '') if isinstance(result[0], dict) else str(result[0])
+        # Post-process: strip any repeated prompt text if returned
+        if isinstance(raw_response, str) and full_prompt.strip() and raw_response.startswith(full_prompt.strip()):
+            raw_response = raw_response[len(full_prompt):].strip()
 
-        # Sentiment
+        # Sentiment analysis (fallback to neutral on error)
         try:
             sentiment = self.sentiment_analyzer(raw_response)[0]
         except Exception as e:
-            # In case sentiment analyzer fails, default to neutral
             self.reflection_log.append(f"Sentiment analyzer error: {e}")
             sentiment = {'label': 'NEUTRAL', 'score': 0.5}
 
