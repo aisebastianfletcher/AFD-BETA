@@ -8,3 +8,4 @@ afd_ami_ethical_assistant.egg-info/SOURCES.txt
 afd_ami_ethical_assistant.egg-info/dependency_links.txt
 afd_ami_ethical_assistant.egg-info/top_level.txt
 tests/test_afd_ami.py
+tests/test_respond_smoke.py
