@@ -1,2 +1,0 @@
-afd_ami_core
-app

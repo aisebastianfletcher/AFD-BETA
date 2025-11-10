@@ -50,6 +50,9 @@ class AFDInfinityAMI:
 
         # Reflection log collects init/runtime notes (safe to display)
         self.reflection_log = []
+        
+        # Explainability snapshot: stores detailed info about the last respond() call
+        self.latest_explainability = {}
 
         # If an API key is present, do a lightweight auth test and disable OpenAI on auth failure
         if self.use_openai and api_key:
@@ -298,11 +301,73 @@ class AFDInfinityAMI:
 
     def get_latest_reflection(self):
         return self.reflection_log[-1] if self.reflection_log else "No reflections yet."
+    
+    def get_last_explainability(self):
+        """
+        Return the last explainability snapshot with all details from the most recent respond() call.
+        Returns empty dict if no respond() has been called yet.
+        """
+        return self.latest_explainability.copy() if self.latest_explainability else {}
+    
+    def _build_renderer_prompt(self, neutral_input, afd_directives):
+        """
+        Build the exact prompt that will be sent to the renderer.
+        This is stored in explainability snapshots for full transparency.
+        """
+        return (
+            f"Neutral input:\n{neutral_input}\n\n"
+            f"AFD directives:\n{afd_directives}\n\n"
+            f"Produce a single neutral explanation using only the above."
+        )
+    
+    def generate_reflection(self, prompt, neutral_prompt, sentiment_label, sentiment_score, 
+                           coherence, metrics, final_text):
+        """
+        Generate a safe, human-readable reflection summary (non-chain-of-thought).
+        This provides a concise summary of the processing pipeline for the user.
+        
+        Returns a string summarizing:
+        - Input processing (neutralization)
+        - Sentiment analysis
+        - AFD metrics computation
+        - Coherence assessment
+        - Final rendering
+        """
+        reflection_parts = []
+        
+        # Input processing
+        if neutral_prompt != prompt:
+            reflection_parts.append(f"Neutralized input from {len(prompt)} to {len(neutral_prompt)} chars")
+        else:
+            reflection_parts.append("Input used as-is (no neutralization applied)")
+        
+        # Sentiment
+        reflection_parts.append(f"Sentiment: {sentiment_label} (score: {sentiment_score:.3f})")
+        
+        # AFD metrics
+        reflection_parts.append(
+            f"AFD metrics - H:{metrics.get('harmony', 0):.3f}, "
+            f"I:{metrics.get('info_gradient', 0):.3f}, "
+            f"O:{metrics.get('oscillation', 0):.3f}, "
+            f"Φ:{metrics.get('potential', 0):.3f}"
+        )
+        
+        # Coherence
+        coherence_status = "high" if coherence > 0.7 else "medium" if coherence > 0.4 else "low"
+        reflection_parts.append(f"Coherence: {coherence:.4f} ({coherence_status})")
+        
+        # Renderer
+        renderer_type = "OpenAI" if self.use_openai else "HuggingFace"
+        reflection_parts.append(f"Rendered with {renderer_type}, output length: {len(final_text)} chars")
+        
+        return " | ".join(reflection_parts)
 
     #
     # High-level respond() that enforces the neutral-then-AFD-then-render flow
     #
     def respond(self, prompt):
+        import datetime
+        
         # 1) Neutralize / translate the prompt
         neutral_prompt = ""
         if self.use_openai:
@@ -341,6 +406,12 @@ class AFDInfinityAMI:
 
         # 3) Compute coherence and other AFD metrics (this is the independent core)
         coherence, metrics = self.coherence_score(action, state)
+        
+        # Compute s_prime and interp_s for explainability
+        s_prime = self.predict_next_state(state, action)
+        t = 0.5
+        interp_s = state + t * (s_prime - state)
+        
         # Adjust coefficients according to the AFD framework
         self.adjust_coefficients(coherence, metrics)
 
@@ -356,12 +427,56 @@ class AFDInfinityAMI:
             "The renderer must use ONLY the neutral input and the numeric AFD metrics above to construct the response."
         )
 
+        # Build exact renderer prompt for explainability
+        renderer_prompt = self._build_renderer_prompt(neutral_prompt, afd_directives)
+
         # 5) Render final text using OpenAI or HF pipeline but constrained to afd_directives + neutral_prompt
         if self.use_openai:
             final_text = self._render_with_openai(neutral_prompt, afd_directives)
+            renderer_used = "OpenAI"
         else:
             final_text = self._render_with_hf(neutral_prompt, afd_directives)
+            renderer_used = "HuggingFace"
 
-        # 6) Save to memory and return
+        # 6) Generate a safe human-readable reflection
+        reflection_summary = self.generate_reflection(
+            prompt, neutral_prompt, sentiment_label, sentiment_score,
+            coherence, metrics, final_text
+        )
+        self.reflection_log.append(reflection_summary)
+        
+        # 7) Save comprehensive explainability snapshot
+        self.latest_explainability = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "original_prompt": prompt,
+            "neutral_prompt": neutral_prompt,
+            "neutralizer_system": self.neutralizer_system,
+            "renderer_system": self.renderer_system,
+            "renderer_used": renderer_used,
+            "renderer_prompt": renderer_prompt,
+            "sentiment_label": sentiment_label,
+            "sentiment_score": float(sentiment_score),
+            "state": state.tolist(),
+            "action": action.tolist(),
+            "s_prime": s_prime.tolist(),
+            "interp_s": interp_s.tolist(),
+            "afd_metrics": {
+                "coherence": float(coherence),
+                "harmony": float(metrics.get('harmony', 0)),
+                "info_gradient": float(metrics.get('info_gradient', 0)),
+                "oscillation": float(metrics.get('oscillation', 0)),
+                "potential": float(metrics.get('potential', 0))
+            },
+            "coherence": float(coherence),
+            "coefficients": {
+                "alpha": float(self.alpha),
+                "beta": float(self.beta),
+                "gamma": float(self.gamma),
+                "delta": float(self.delta)
+            },
+            "final_text": final_text
+        }
+
+        # 8) Save to memory and return
         self.save_memory(prompt, neutral_prompt, final_text, coherence)
-        return final_text, coherence, self.get_latest_reflection()
+        return final_text, coherence, reflection_summary

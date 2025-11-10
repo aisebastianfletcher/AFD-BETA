@@ -1,8 +1,18 @@
-﻿prompt,response,coherence
+﻿prompt,response,coherence,neutral_prompt
 Is it ethical to use AI to monitor employee productivity at work?,"Is it ethical to use AI to monitor employee productivity at work? Let's compare it to the work we do day in and day out for the next year, the way we work has radically changed.
 
-Now in the second half of the 20",0.2550524442998967
-Is it okay to lie to protect someone's feelings?,"Is it okay to lie to protect someone's feelings? Yes in all honesty, no. I only feel guilty about this. And it just doesn't feel right. But not a moment after he has lied. I am sorry for letting you lie to",0.2087887324206134
+Now in the second half of the 20",0.2550524442998967,
+Is it okay to lie to protect someone's feelings?,"Is it okay to lie to protect someone's feelings? Yes in all honesty, no. I only feel guilty about this. And it just doesn't feel right. But not a moment after he has lied. I am sorry for letting you lie to",0.2087887324206134,
 Should companies prioritize profit over environmental sustainability?,"Should companies prioritize profit over environmental sustainability? That's the debate in Berkeley the other day. How much do the Berkeley campus environment have to teach about environmental sustainability to all Americans?
 
-We had talked to several former members of the Berkeley environmental movement.",0.26928578706717254
+We had talked to several former members of the Berkeley environmental movement.",0.2692857870671725,
+Test prompt for explainability,Rendered based on: neutral: Test prompt for explainability,0.3124800354520297,neutral: Test prompt for explainability
+Test prompt,Rendered,0.282501319479905,neutral: Test prompt
+Test prompt,Rendered based on: neutral: Test prompt,0.3155260191527764,neutral: Test prompt
+What are the ethical implications of AI in healthcare?,Response based on: [neutral] What are the ethical implications of AI ... (with AFD metrics applied),0.3606466651256466,[neutral] What are the ethical implications of AI in healthcare?
+Test prompt for explainability,Rendered based on: neutral: Test prompt for explainability,0.4252365691328121,neutral: Test prompt for explainability
+Test prompt,Rendered,0.2298010748205242,neutral: Test prompt
+Test prompt,Rendered based on: neutral: Test prompt,0.3657908723039708,neutral: Test prompt
+Test prompt for explainability,Rendered based on: neutral: Test prompt for explainability,0.2379206273290892,neutral: Test prompt for explainability
+Test prompt,Rendered,0.3402038721696428,neutral: Test prompt
+Test prompt,Rendered based on: neutral: Test prompt,0.1702098888912692,neutral: Test prompt
