@@ -12,4 +12,7 @@ Test prompt,Rendered based on: neutral: Test prompt,0.3155260191527764,neutral: 
 What are the ethical implications of AI in healthcare?,Response based on: [neutral] What are the ethical implications of AI ... (with AFD metrics applied),0.3606466651256466,[neutral] What are the ethical implications of AI in healthcare?
 Test prompt for explainability,Rendered based on: neutral: Test prompt for explainability,0.4252365691328121,neutral: Test prompt for explainability
 Test prompt,Rendered,0.2298010748205242,neutral: Test prompt
-Test prompt,Rendered based on: neutral: Test prompt,0.36579087230397084,neutral: Test prompt
+Test prompt,Rendered based on: neutral: Test prompt,0.3657908723039708,neutral: Test prompt
+Test prompt for explainability,Rendered based on: neutral: Test prompt for explainability,0.2379206273290892,neutral: Test prompt for explainability
+Test prompt,Rendered,0.3402038721696428,neutral: Test prompt
+Test prompt,Rendered based on: neutral: Test prompt,0.1702098888912692,neutral: Test prompt
