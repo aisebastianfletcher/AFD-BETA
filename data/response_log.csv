@@ -9,4 +9,7 @@ We had talked to several former members of the Berkeley environmental movement."
 Test prompt for explainability,Rendered based on: neutral: Test prompt for explainability,0.3124800354520297,neutral: Test prompt for explainability
 Test prompt,Rendered,0.282501319479905,neutral: Test prompt
 Test prompt,Rendered based on: neutral: Test prompt,0.3155260191527764,neutral: Test prompt
-What are the ethical implications of AI in healthcare?,Response based on: [neutral] What are the ethical implications of AI ... (with AFD metrics applied),0.36064666512564664,[neutral] What are the ethical implications of AI in healthcare?
+What are the ethical implications of AI in healthcare?,Response based on: [neutral] What are the ethical implications of AI ... (with AFD metrics applied),0.3606466651256466,[neutral] What are the ethical implications of AI in healthcare?
+Test prompt for explainability,Rendered based on: neutral: Test prompt for explainability,0.4252365691328121,neutral: Test prompt for explainability
+Test prompt,Rendered,0.2298010748205242,neutral: Test prompt
+Test prompt,Rendered based on: neutral: Test prompt,0.36579087230397084,neutral: Test prompt
