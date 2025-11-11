@@ -1,10 +1,12 @@
 """
-AFDInfinityAMI - AFD-driven assistant core with:
-- rule-based neutralizer for LLM-free AFD mode
-- high-variance, seedable AFD renderer (temperature + seed)
-- memory persistence (CSV) and explainability JSONL
-- deterministic AFD reflection and optional human-style post-hoc reflection (hidden by default)
-- safe OpenAI/HF fallbacks when renderer_mode == 'llm'
+AFDInfinityAMI - AFD-driven assistant core.
+
+Features:
+- Rule-based neutralizer for LLM-free AFD mode.
+- High-variance, seedable AFD renderer (temperature + seed).
+- Memory persistence (CSV) and explainability JSONL.
+- Deterministic AFD reflection and optional human-style post-hoc reflection (hidden in UI by default).
+- Safe OpenAI/HF fallbacks when renderer_mode == 'llm'.
 """
 import os
 import json
@@ -29,7 +31,7 @@ class AFDInfinityAMI:
         self.temperature = float(temperature or 0.0)
         self.memory_window = int(memory_window or 10)
 
-        # OpenAI key normalization (no printing)
+        # OpenAI key normalization (do not print keys)
         raw_key = openai_api_key or None
         try:
             if raw_key is None and hasattr(st, "secrets"):
@@ -78,7 +80,7 @@ class AFDInfinityAMI:
         # coefficients
         self.alpha, self.beta, self.gamma, self.delta = 1.0, 1.0, 0.5, 0.5
 
-        # system prompts
+        # prompts
         self.neutralizer_system = (
             "You are a precise neutral translator. Convert the user's input into a short, "
             "neutral, factual description suitable for algorithmic processing. "
@@ -95,7 +97,7 @@ class AFDInfinityAMI:
         self.latest_explainability = None
 
     def _test_openai_key(self):
-        # minimal call to validate API (cheap)
+        # minimal call; exceptions bubbled to caller
         openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": "Ping for auth test. Reply with 'ok'."}],
@@ -142,7 +144,7 @@ class AFDInfinityAMI:
         return self.sentiment_analyzer
 
     #
-    # Rule-based neutralizer used by AFD deterministic path (no LLM calls)
+    # Rule-based neutralizer (no LLM) used for 'afd' renderer mode
     #
     def _rule_neutralize(self, user_input: str) -> str:
         s = (user_input or "").strip()
@@ -170,7 +172,7 @@ class AFDInfinityAMI:
         return f"neutral summary: {trimmed}"
 
     #
-    # LLM neutralizers / renderers (only used in 'llm' mode)
+    # LLM neutralizers / renderers (used only when renderer_mode == 'llm')
     #
     def _neutralize_with_openai(self, user_input):
         try:
@@ -375,12 +377,12 @@ class AFDInfinityAMI:
                 metrics_noisy[k] = float(v)
 
         c = float(coherence) + float(rng.normal(0.0, noise_scale))
-        h = metrics_noisy.get("harmony", 0.0)
-        ig = metrics_noisy.get("info_gradient", 0.0)
-        o = metrics_noisy.get("oscillation", 0.0)
-        phi = metrics_noisy.get("potential", 0.0)
+        harmony = metrics_noisy.get("harmony", 0.0)
+        info_grad = metrics_noisy.get("info_gradient", 0.0)
+        oscill = metrics_noisy.get("oscillation", 0.0)
+        potential = metrics_noisy.get("potential", 0.0)
 
-        # large fragment pools for variety
+        # fragment pools for variety
         openings = [
             "In brief:",
             "To summarize briefly:",
@@ -388,32 +390,32 @@ class AFDInfinityAMI:
             "Concise summary:",
             "Here's a succinct view:",
             "Quickly put:",
-            "Shortly:"
+            "Shortly:",
         ]
         middles = [
             f"{neutral_prompt}.",
             f"{neutral_prompt} This is the essential restatement.",
             f"{neutral_prompt} (neutralized summary).",
             f"{neutral_prompt} — core summary.",
-            f"{neutral_prompt}; distilled."
+            f"{neutral_prompt}; distilled.",
         ]
         closers = [
             "This evaluation supports a direct explanation.",
             "The metrics indicate a cautious framing is appropriate.",
             "I frame the answer to balance clarity and caution.",
             "I will emphasize main points while avoiding speculation.",
-            "This suggests a focused, careful summary."
+            "This suggests a focused, careful summary.",
         ]
 
         templates = []
-        for o in openings:
-            for m in middles:
-                for cphrase in closers:
-                    templates.append(f"{o} {m} {cphrase}")
+        for op in openings:
+            for mid in middles:
+                for cl in closers:
+                    templates.append(f"{op} {mid} {cl}")
         extra_templates = [
             f"{neutral_prompt}. From the AFD perspective, coherence={c:.3f} and this guides the tone.",
             f"{neutral_prompt} — AFD coherence {c:.3f}; the assistant adapts tone and detail.",
-            f"Neutral summary: {neutral_prompt}. AFD coherence={c:.3f}, shaping the response."
+            f"Neutral summary: {neutral_prompt}. AFD coherence={c:.3f}, shaping the response.",
         ]
         templates.extend(extra_templates)
 
@@ -421,7 +423,7 @@ class AFDInfinityAMI:
             "present": ["provide", "offer", "deliver"],
             "concise": ["brief", "succinct", "compact"],
             "cautious": ["careful", "measured", "guarded"],
-            "uncertainty": ["lack of strong consensus", "unclear signals", "uncertain evidence"]
+            "uncertainty": ["lack of strong consensus", "unclear signals", "uncertain evidence"],
         }
 
         if temp <= 0.0:
@@ -436,10 +438,10 @@ class AFDInfinityAMI:
         template = templates[template_idx]
 
         if temp > 0.45:
-            for k, opts in paraphrases.items():
-                if k in template and rng.random() < min(0.9, temp):
+            for key, opts in paraphrases.items():
+                if key in template and rng.random() < min(0.9, temp):
                     choice = rng.choice(opts)
-                    template = template.replace(k, choice, 1)
+                    template = template.replace(key, choice, 1)
 
         # rationale parts
         rationale_parts = []
@@ -450,17 +452,17 @@ class AFDInfinityAMI:
         else:
             rationale_parts.append("Moderate coherence → provide a balanced, cautious explanation.")
 
-        if h > 0.6:
+        if harmony > 0.6:
             rationale_parts.append("High harmony → highlight consistent points.")
-        elif h < 0.2:
+        elif harmony < 0.2:
             rationale_parts.append("Low harmony → clarify ambiguities.")
 
-        if ig > 0.5:
+        if info_grad > 0.5:
             rationale_parts.append("High information gradient → include supporting detail.")
         else:
             rationale_parts.append("Low information gradient → favor concision.")
 
-        if o > 0.2:
+        if oscill > 0.2:
             rationale_parts.append("High oscillation → avoid speculation.")
 
         if memory_summary and memory_summary.get("avg_coherence") is not None:
@@ -475,22 +477,22 @@ class AFDInfinityAMI:
             style_options = [
                 "I'll be explicit about caveats and assumptions.",
                 "I'll foreground the most robust points first, then add nuance.",
-                "I'll give a short answer up front followed by a concise elaboration."
+                "I'll give a short answer up front followed by a concise elaboration.",
             ]
             extra_sentence = str(rng.choice(style_options))
 
-        # compose answer synthesis sentences
+        # compose answer sentences
         answer_sentences = []
         if c >= 0.8:
             answer_sentences.append(f"A concise synthesis: {neutral_prompt}.")
-            if ig > 0.4:
+            if info_grad > 0.4:
                 answer_sentences.append("Key supporting points are included where helpful.")
         elif c <= 0.35:
             answer_sentences.append(f"A cautious synthesis: {neutral_prompt}.")
             answer_sentences.append("Information is not strongly aligned; I avoid definitive claims.")
         else:
             answer_sentences.append(f"A balanced synthesis: {neutral_prompt}.")
-            if ig > 0.4:
+            if info_grad > 0.4:
                 answer_sentences.append("I include a couple of clarifying details to support the summary.")
 
         if memory_summary and memory_summary.get("top_tokens") and temp > 0.3:
@@ -518,14 +520,13 @@ class AFDInfinityAMI:
         return "\n".join(lines)
 
     #
-    # Human-style reflection (post-hoc, stored but hidden by default)
+    # Human-style reflection (post-hoc)
     #
     def generate_human_style_reflection(self, neutral_prompt, metrics, coherence, memory_summary=None):
         c = float(coherence)
         h = float(metrics.get("harmony", 0.0))
         ig = float(metrics.get("info_gradient", 0.0))
         o = float(metrics.get("oscillation", 0.0))
-        phi = float(metrics.get("potential", 0.0))
 
         identity = (
             "I am an algorithmic assistant. I don't have consciousness or feelings, "
@@ -544,13 +545,9 @@ class AFDInfinityAMI:
             if h > 0.6
             else "There are mixed internal signals; I will highlight ambiguities."
         )
-
         detail_note = "I'll include supporting detail." if ig > 0.5 else "I'll keep the explanation concise."
-        stability_note = (
-            "Internal state is reasonably stable; I won't speculate."
-            if o <= 0.2
-            else "Internal state shows some instability; I'll avoid speculation."
-        )
+        stability_note = "Internal state is reasonably stable; I won't speculate." if o <= 0.2 else "Internal state shows some instability; I'll avoid speculation."
+
         neutral_echo = neutral_prompt if len(neutral_prompt) <= 200 else neutral_prompt[:197] + "…"
 
         paragraphs = []
@@ -571,13 +568,11 @@ class AFDInfinityAMI:
             paragraphs.append(mem_line)
 
         paragraphs.append("")
-        paragraphs.append(
-            "This summary explains how my internal AFD evaluation shapes the tone and caution level of the forthcoming answer."
-        )
+        paragraphs.append("This summary explains how my internal AFD evaluation shapes the tone and caution level of the forthcoming answer.")
         return "\n".join(paragraphs)
 
     #
-    # Structured AFD reflection (authoritative)
+    # Structured AFD reflection
     #
     def generate_afd_reflection(self, prompt, neutral_prompt, state, action, s_prime, interp_s, metrics, coherence, renderer_used):
         lines = []
@@ -606,10 +601,10 @@ class AFDInfinityAMI:
         return f"Neutral input:\n{neutral_input}\n\nAFD directives:\n{afd_directives}\n\nProduce a single neutral explanation using only the above."
 
     #
-    # Main respond (supports renderer_mode 'afd' (default) or 'llm'), optional seed and memory inclusion
+    # Main respond
     #
     def respond(self, prompt, renderer_mode="afd", include_memory=True, seed=None):
-        # 1) neutralize (LLM-free when using afd renderer)
+        # neutralize (LLM-free for afd)
         if renderer_mode == "afd":
             neutral_prompt = self._rule_neutralize(prompt)
         else:
@@ -620,7 +615,7 @@ class AFDInfinityAMI:
         if not neutral_prompt:
             neutral_prompt = prompt.strip()
 
-        # 2) optionally summarize memory
+        # memory summary
         memory_summary = None
         if include_memory:
             try:
@@ -629,10 +624,9 @@ class AFDInfinityAMI:
                 self.reflection_log.append(f"Memory summary error: {e}")
                 memory_summary = None
 
-        # 3) sentiment/state proxy (avoid initializing HF sentiment when not needed)
+        # sentiment/state proxy
         try:
             if self.use_openai and renderer_mode != "llm":
-                # keep sentiment neutral to avoid HF init when OpenAI is preferred but AFD mode used
                 sentiment_score = 0.5
                 sentiment_label = "NEUTRAL"
             else:
@@ -652,16 +646,16 @@ class AFDInfinityAMI:
         state = np.array([sentiment_score] * 5)
         action = np.array([1 if str(sentiment_label).upper().startswith("POS") else -1] * 5)
 
-        # 4) AFD math
+        # AFD math
         s_prime = self.predict_next_state(state, action)
         t = 0.5
         interp_s = state + t * (s_prime - state)
-        h = self.compute_harmony(state, interp_s)
-        i = self.compute_info_gradient(state, interp_s)
-        o = self.compute_oscillation(state, interp_s)
-        phi = self.compute_potential(s_prime)
-        coherence = float(self.alpha * h + self.beta * i - self.gamma * o + self.delta * phi)
-        metrics = {"harmony": float(h), "info_gradient": float(i), "oscillation": float(o), "potential": float(phi)}
+        harmony = self.compute_harmony(state, interp_s)
+        info_grad = self.compute_info_gradient(state, interp_s)
+        oscill = self.compute_oscillation(state, interp_s)
+        potential = self.compute_potential(s_prime)
+        coherence = float(self.alpha * harmony + self.beta * info_grad - self.gamma * oscill + self.delta * potential)
+        metrics = {"harmony": float(harmony), "info_gradient": float(info_grad), "oscillation": float(oscill), "potential": float(potential)}
 
         # small memory-driven coefficient nudges
         try:
@@ -690,7 +684,7 @@ class AFDInfinityAMI:
         )
         renderer_prompt = self._build_renderer_prompt(neutral_prompt, afd_directives)
 
-        # 5) Rendering
+        # render
         if renderer_mode == "afd":
             final_text = self._afd_renderer(neutral_prompt, afd_directives, metrics, coherence, memory_summary=memory_summary, seed=seed)
             renderer_used = "AFD (deterministic)"
@@ -702,7 +696,7 @@ class AFDInfinityAMI:
                 final_text = self._render_with_hf(neutral_prompt, afd_directives)
                 renderer_used = "HF"
 
-        # 6) persist
+        # persist
         try:
             self.save_memory(prompt, neutral_prompt, final_text, coherence)
         except Exception:
@@ -729,7 +723,6 @@ class AFDInfinityAMI:
             "memory_summary": memory_summary,
         }
 
-        # human-style reflection stored (hidden by default in UI)
         human_reflection = self.generate_human_style_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
         explainability["human_reflection"] = human_reflection
 
@@ -739,7 +732,6 @@ class AFDInfinityAMI:
         except Exception:
             pass
 
-        # authoritative AFD reflection returned to UI
         afd_reflection = self.generate_afd_reflection(
             prompt, neutral_prompt, state, action, s_prime, interp_s, metrics, coherence, renderer_used
         )
