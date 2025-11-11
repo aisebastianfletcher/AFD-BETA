@@ -1,12 +1,11 @@
 """
-AFDInfinityAMI - AFD-driven assistant core with memory-aware reflections and temperature variability.
+AFDInfinityAMI - AFD-driven assistant core with memory-aware reflections and higher-variance AFD renderer.
 
-Features:
-- Deterministic AFD renderer (default) with controlled variability via temperature.
-- Human-style, post-hoc reflection derived from AFD internals and recent memory (NOT chain-of-thought).
-- Memory persistence: CSV memory log + JSONL explainability log.
-- Memory summarization used to influence reflections and small coefficient adjustments.
-- Lazy HF init and safe OpenAI handling.
+Notes:
+- _afd_renderer now supports a seed, stronger temperature-affected variation, multiple templates,
+  paraphrase fragments, sentence reordering, and optional extra paragraphs when temperature is high.
+- respond(...) accepts `seed` and passes it through to stochastic parts.
+- Human-style reflection and debug fields are produced and stored, but not printed by default by the UI.
 """
 import os
 import json
@@ -19,7 +18,6 @@ import openai
 import torch
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 
-# Best-effort import of OpenAI auth error type
 try:
     from openai.error import AuthenticationError as OpenAIAuthError
 except Exception:
@@ -57,6 +55,7 @@ class AFDInfinityAMI:
         if self.use_openai and api_key:
             try:
                 self._test_openai_key()
+                # Note: we record this in reflection_log but do not surface "Using OpenAI: True" in the main UI.
                 self.reflection_log.append("OpenAI key test succeeded.")
             except OpenAIAuthError as e:
                 self.use_openai = False
@@ -106,9 +105,6 @@ class AFDInfinityAMI:
         )
         return True
 
-    #
-    # Lazy HF initializers and caches
-    #
     @st.cache_resource
     def _cache_llm(_self):
         model_name = "distilgpt2"
@@ -143,9 +139,6 @@ class AFDInfinityAMI:
                 self.sentiment_analyzer = None
         return self.sentiment_analyzer
 
-    #
-    # Neutralizers and renderers (OpenAI & HF fallbacks)
-    #
     def _neutralize_with_openai(self, user_input):
         try:
             messages = [
@@ -227,9 +220,6 @@ class AFDInfinityAMI:
             self.reflection_log.append(f"HF render error: {e}")
             return "Unable to render response locally."
 
-    #
-    # AFD core math
-    #
     def predict_next_state(self, state, action):
         return state + np.random.normal(0, 0.1, state.shape)
 
@@ -267,9 +257,6 @@ class AFDInfinityAMI:
         else:
             self.reflection_log.append(f"No adjustment needed. {log}")
 
-    #
-    # Memory and explainability persistence
-    #
     def save_memory(self, prompt, neutral_prompt, response, coherence):
         try:
             df = pd.read_csv(self.memory_file, encoding="utf-8-sig")
@@ -308,19 +295,11 @@ class AFDInfinityAMI:
     def get_latest_reflection(self):
         return self.reflection_log[-1] if self.reflection_log else "No reflections yet."
 
-    #
-    # Memory summarization helper (simple, fast)
-    #
     def _summarize_memory(self, n=None):
-        """
-        Return a small summary dictionary of the last n memory rows:
-        - avg_coherence, count, last_prompts (neutral), top_tokens
-        """
         n = int(n) if n is not None else int(self.memory_window)
         df = self.load_memory()
         if df.empty:
             return {"count": 0, "avg_coherence": None, "last_neutral_prompts": [], "top_tokens": []}
-
         tail = df.tail(n)
         avg_coh = None
         try:
@@ -328,28 +307,29 @@ class AFDInfinityAMI:
         except Exception:
             avg_coh = None
         last_neutrals = tail["neutral_prompt"].fillna("").astype(str).tolist()
-
-        # naive token counting, filter short tokens and common stopwords
         stopwords = {"the", "a", "an", "and", "or", "in", "on", "of", "to", "is", "are", "for", "with", "that", "this"}
         token_counter = collections.Counter()
         for s in last_neutrals:
-            # simple tokenization
             tokens = re.findall(r"[A-Za-z]{3,}", s.lower())
             for t in tokens:
                 if t not in stopwords:
                     token_counter[t] += 1
         top_tokens = [tok for tok, _ in token_counter.most_common(8)]
-
         return {"count": len(tail), "avg_coherence": avg_coh, "last_neutral_prompts": last_neutrals, "top_tokens": top_tokens}
 
-    #
-    # Deterministic AFD renderer (uses memory_summary to reference past)
-    #
-    def _afd_renderer(self, neutral_prompt, afd_directives, metrics, coherence, memory_summary=None):
-        rng = np.random.default_rng()
-        temp = max(0.0, float(self.temperature))
-        noise_scale = max(0.0, temp * 0.04)
+    def _afd_renderer(self, neutral_prompt, afd_directives, metrics, coherence, memory_summary=None, seed=None):
+        """
+        Higher-variance AFD renderer:
+        - Use a seed when provided to make outputs reproducible.
+        - Use temperature to control noise magnitude and template sampling.
+        - Produce more diverse phrasing (templates + paraphrase fragments).
+        """
+        # deterministic RNG when seed provided, else random
+        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+        temp = float(max(0.0, min(self.temperature, 2.5)))  # extended top end
+        noise_scale = max(0.0, temp * 0.06)
 
+        # small metric perturbation proportional to temperature
         metrics_noisy = {}
         for k, v in metrics.items():
             try:
@@ -363,31 +343,77 @@ class AFDInfinityAMI:
         o = metrics_noisy.get("oscillation", 0.0)
         phi = metrics_noisy.get("potential", 0.0)
 
-        templates = [
-            f"In short: {neutral_prompt}. The AFD evaluation supports a direct, concise answer.",
-            f"I would summarize: {neutral_prompt}. The AFD metrics support a straightforward explanation.",
-            f"Summarizing: {neutral_prompt}. The numeric AFD evaluation suggests the following concise take.",
+        # Phrase fragments to mix & match for more variety
+        openings = [
+            "In brief:",
+            "To summarize briefly:",
+            "A short take:",
+            "Concise summary:",
+            "Here's a succinct view:"
+        ]
+        middles = [
+            f"{neutral_prompt}.",
+            f"{neutral_prompt} This is the essential restatement.",
+            f"{neutral_prompt} (neutralized summary).",
+            f"{neutral_prompt} — core summary."
+        ]
+        closers = [
+            "This evaluation supports a direct explanation.",
+            "The metrics indicate a cautious framing is appropriate.",
+            "I frame the answer to balance clarity and caution.",
+            "I will emphasize main points while avoiding speculation."
         ]
 
+        # Build a larger set of templates mixing fragments
+        templates = []
+        for o in openings:
+            for m in middles:
+                for cphrase in closers:
+                    templates.append(f"{o} {m} {cphrase}")
+
+        # Allow more diverse syntactic templates
+        extra_templates = [
+            f"{neutral_prompt}. From the AFD perspective, coherence={c:.3f} and this guides the tone of the answer.",
+            f"{neutral_prompt} — AFD coherence {c:.3f}; the assistant therefore adapts tone and detail.",
+            f"Neutral summary: {neutral_prompt}. AFD metrics suggest coherence={c:.3f}, influencing a careful wording."
+        ]
+        templates.extend(extra_templates)
+
+        # Paraphrase dictionary (small, safe)
+        paraphrases = {
+            "present": ["provide", "offer", "deliver"],
+            "concise": ["brief", "succinct", "compact"],
+            "cautious": ["careful", "measured", "guarded"],
+            "uncertainty": ["lack of strong consensus", "unclear signals", "uncertain evidence"]
+        }
+
+        # Choose template index with distribution flattened by temperature
         if temp <= 0.0:
             template_idx = 0
         else:
-            base = np.array([0.6, 0.25, 0.15])
-            mix = min(1.0, temp / 1.0)
-            weights = (1.0 - mix) * base + mix * np.array([1.0 / 3.0] * 3)
-            weights = weights.clip(min=1e-6)
+            base = np.ones(len(templates))
+            mix = min(1.0, temp / 1.5)
+            weights = (1.0 - mix) * base + mix * (np.arange(len(templates)) * 0 + 1.0)
             weights = weights / weights.sum()
-            template_idx = int(rng.choice(3, p=weights))
+            template_idx = int(rng.choice(len(templates), p=weights))
 
-        answer_line = templates[template_idx]
+        template = templates[template_idx]
 
+        # Apply lightweight paraphrasing when temperature > 0.4
+        if temp > 0.4:
+            for k, opts in paraphrases.items():
+                if k in template and rng.random() < min(0.8, temp):
+                    choice = rng.choice(opts)
+                    template = template.replace(k, choice, 1)
+
+        # Build rationale lines deterministically but vary order at higher temp
         rationale_parts = []
         if c >= 0.8:
-            rationale_parts.append("High coherence → present a concise, confident explanation.")
+            rationale_parts.append("High coherence → deliver a direct, confident explanation.")
         elif c <= 0.35:
             rationale_parts.append("Low coherence → emphasize uncertainty and avoid strong claims.")
         else:
-            rationale_parts.append("Moderate coherence → balanced and cautious explanation.")
+            rationale_parts.append("Moderate coherence → provide a balanced, cautious explanation.")
 
         if h > 0.6:
             rationale_parts.append("High harmony → highlight consistent points.")
@@ -395,42 +421,72 @@ class AFDInfinityAMI:
             rationale_parts.append("Low harmony → clarify ambiguities.")
 
         if ig > 0.5:
-            rationale_parts.append("High information gradient → include supporting details.")
+            rationale_parts.append("High information gradient → include supporting detail.")
         else:
-            rationale_parts.append("Low information gradient → keep it concise.")
+            rationale_parts.append("Low information gradient → favor concision.")
 
         if o > 0.2:
             rationale_parts.append("High oscillation → avoid speculation.")
 
         if memory_summary and memory_summary.get("avg_coherence") is not None:
             avg = memory_summary.get("avg_coherence")
-            rationale_parts.append(f"Past interactions (last {memory_summary.get('count')}) average coherence={avg:.3f}, which the agent uses to calibrate tone.")
+            rationale_parts.append(f"Recent memory avg coherence={avg:.3f}, used to calibrate tone.")
 
-        if temp > 0.6:
-            extra_styles = [
-                "I will phrase this succinctly.",
-                "I will focus on clarity and brevity.",
-                "I will aim to highlight the most relevant points first.",
+        # Reorder rationale parts with some randomness if temp is high
+        if temp > 0.7:
+            rng.shuffle(rationale_parts)
+
+        # Optionally add an extra stylistic sentence when temperature large
+        extra_sentence = ""
+        if temp >= 1.2:
+            style_options = [
+                "I'll try to be particularly clear about caveats and assumptions.",
+                "I'll foreground the most robust points first, then add nuance.",
+                "I'll give a short answer up front followed by a concise elaboration."
             ]
-            extra_choice = int(rng.integers(0, len(extra_styles)))
-            rationale_parts.append(extra_styles[extra_choice])
+            extra_sentence = rng.choice(style_options)
 
+        # Compose final text: join template, rationale bullets, optional extra sentence
         lines = []
-        lines.append(f"Neutral input: {neutral_prompt}")
+        lines.append(template)
         lines.append("")
-        lines.append("AFD Summary (numeric):")
-        lines.append(f"- coherence: {c:.6f}")
-        lines.append(f"- harmony: {h:.6f}")
-        lines.append(f"- info_gradient: {ig:.6f}")
-        lines.append(f"- oscillation: {o:.6f}")
-        lines.append(f"- potential: {phi:.6f}")
-        lines.append("")
-        lines.append("Deterministic explanation derived from AFD metrics:")
+        lines.append("AFD rationale (derived):")
         for p in rationale_parts:
             lines.append(f"- {p}")
+        if extra_sentence:
+            lines.append("")
+            lines.append(extra_sentence)
+
+        # Also include an explicit "Answer" paragraph that synthesizes rather than repeats neutral_prompt
+        answer_sentences = []
+        # pick some high-level sentence patterns influenced by coherence
+        if c >= 0.8:
+            answer_sentences.append(f"A concise synthesis: {neutral_prompt}.")
+            if ig > 0.4:
+                answer_sentences.append("Key supporting points should be included where helpful.")
+        elif c <= 0.35:
+            answer_sentences.append(f"A cautious synthesis: {neutral_prompt}.")
+            answer_sentences.append("Information is not strongly aligned; avoid definitive claims.")
+        else:
+            answer_sentences.append(f"A balanced synthesis: {neutral_prompt}.")
+            if ig > 0.4:
+                answer_sentences.append("Include a couple of clarifying details to support the summary.")
+
+        # optionally include memory tokens as contextual recall if present and temp moderate
+        if memory_summary and memory_summary.get("top_tokens") and temp > 0.3:
+            tokens = memory_summary.get("top_tokens")[:4]
+            if tokens:
+                answer_sentences.append("Related recent topics: " + ", ".join(tokens) + ".")
+
+        # shuffle answer sentence order slightly at higher temperature
+        if temp > 0.9:
+            rng.shuffle(answer_sentences)
+
         lines.append("")
         lines.append("Answer:")
-        lines.append(answer_line)
+        for s in answer_sentences:
+            lines.append(f"- {s}")
+
         return "\n".join(lines)
 
     def generate_human_style_reflection(self, neutral_prompt, metrics, coherence, memory_summary=None):
@@ -495,9 +551,6 @@ class AFDInfinityAMI:
         paragraphs.append("This reflection is a concise, human-style summary of my internal AFD evaluation and how it influences the forthcoming answer.")
         return "\n".join(paragraphs)
 
-    #
-    # Deterministic AFD reflection (structured, authoritative)
-    #
     def generate_afd_reflection(self, prompt, neutral_prompt, state, action, s_prime, interp_s, metrics, coherence, renderer_used):
         lines = []
         lines.append("AFD Reflection:")
@@ -524,7 +577,7 @@ class AFDInfinityAMI:
     def _build_renderer_prompt(self, neutral_input, afd_directives):
         return f"Neutral input:\n{neutral_input}\n\nAFD directives:\n{afd_directives}\n\nProduce a single neutral explanation using only the above."
 
-    def respond(self, prompt, renderer_mode="afd", include_memory=True):
+    def respond(self, prompt, renderer_mode="afd", include_memory=True, seed=None):
         # neutralize
         neutral_prompt = ""
         if self.use_openai:
@@ -576,11 +629,10 @@ class AFDInfinityAMI:
         coherence = float(self.alpha * h + self.beta * i - self.gamma * o + self.delta * phi)
         metrics = {"harmony": float(h), "info_gradient": float(i), "oscillation": float(o), "potential": float(phi)}
 
-        # lightweight historical feedback: nudge coefficients by historical avg coherence (if available)
+        # historical feedback: nudge coefficients by historical avg coherence (if available)
         try:
             if memory_summary and memory_summary.get("avg_coherence") is not None:
                 avg_hist = memory_summary.get("avg_coherence")
-                # small adjustment: if past average low, increase alpha to favor harmony
                 if avg_hist < 0.45:
                     self.alpha += 0.02
                     self.reflection_log.append(f"Adjusted alpha slightly based on memory avg_coherence={avg_hist:.3f}")
@@ -607,7 +659,7 @@ class AFDInfinityAMI:
 
         # choose renderer
         if renderer_mode == "afd":
-            final_text = self._afd_renderer(neutral_prompt, afd_directives, metrics, coherence, memory_summary=memory_summary)
+            final_text = self._afd_renderer(neutral_prompt, afd_directives, metrics, coherence, memory_summary=memory_summary, seed=seed)
             renderer_used = "AFD (deterministic)"
         else:
             if self.use_openai:
