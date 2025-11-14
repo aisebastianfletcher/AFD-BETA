@@ -1,14 +1,12 @@
 """
-AFDInfinityAMI - AFD-driven assistant core with intent detection, safe reflections,
-chat-context separation (avoid echoing), and conservative learning.
+AFDInfinityAMI - Fixed robust reflections and safe guards.
 
-Key changes:
-- respond(...) now accepts chat_context (string); the agent neutralizes only the user message
-  and does NOT include the conversation dump into the neutral prompt.
-- detect 'opinion' intent (e.g., "what are your thoughts on X") and, for that intent, prepend
-  the safe, post-hoc reasoning_reflection to the answer.
-- explainability now contains detected_intent and chat_context for auditing.
-- _afd_renderer takes an 'intent' parameter to let identity/opinion queries use specific templates.
+This file is the full AFD core with a defensive fix: reflection-generation
+calls in respond(...) are wrapped with try/except so a failure inside any
+reflection helper won't crash respond(). Exceptions are recorded to
+self.reflection_log and the agent falls back to safe defaults.
+
+Paste this file to overwrite afd_ami_core.py, restart Streamlit, and re-run.
 """
 from typing import Optional
 import os
@@ -83,6 +81,7 @@ class AFDInfinityAMI:
         self._hf_llm = None
         self.sentiment_analyzer = None
 
+        # test OpenAI key quietly (record to log only)
         if self.use_openai and api_key:
             try:
                 self._test_openai_key()
@@ -133,7 +132,7 @@ class AFDInfinityAMI:
         return self.sentiment_analyzer
 
     #
-    # Neutralizers
+    # Neutralizer helpers
     #
     def _rule_neutralize(self, user_input: str) -> str:
         s = (user_input or "").strip()
@@ -221,18 +220,14 @@ class AFDInfinityAMI:
     #
     def _detect_intent(self, neutral_prompt: str) -> str:
         nprompt = (neutral_prompt or "").lower().strip()
-        # identity patterns
         if re.search(r"\b(who (am i|are you|is this|am i speaking to|am i talking to)|are you a|who are you)\b", nprompt):
             return "identity"
         if re.search(r"\b(agent identity|agent identity inquiry|identity inquiry)\b", nprompt):
             return "identity"
-        # opinion/thoughts request
         if re.search(r"\b(your thoughts|what are your thoughts|what do you think|your view|what's your view)\b", nprompt):
             return "opinion"
-        # definition patterns
         if re.match(r"^(definition|definition/explanation request:|what is|what are)\b", nprompt):
             return "definition"
-        # explain/descriptive
         if nprompt.startswith(("explain ", "describe ", "summarize ", "compare ", "tell me about ")):
             return "explain"
         return "unknown"
@@ -386,20 +381,26 @@ class AFDInfinityAMI:
         return {"count": len(tail), "avg_coherence": avg_coh, "avg_outcome": avg_out, "last_neutral_prompts": last_neutrals, "top_tokens": top_tokens}
 
     #
-    # Deterministic AFD renderer (no LLM). Accepts an 'intent' and 'chat_context' to avoid echo.
+    # Simulated renderer + intent-aware behavior
     #
     def _afd_renderer(self, neutral_prompt: str, afd_directives: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None, seed: Optional[int] = None, intent: Optional[str] = None, chat_context: Optional[str] = None) -> str:
         rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
         temp = float(max(0.0, min(self.temperature, 3.0)))
         noise_scale = max(0.0, temp * 0.06)
 
-        # perturb metrics
+        # safe guards for metrics
+        if not isinstance(metrics, dict):
+            metrics = {"harmony": 0.0, "info_gradient": 0.0, "oscillation": 0.0, "potential": 0.0}
+
         metrics_noisy = {}
         for k, v in metrics.items():
             try:
                 metrics_noisy[k] = float(v) + float(rng.normal(0.0, noise_scale))
             except Exception:
-                metrics_noisy[k] = float(v)
+                try:
+                    metrics_noisy[k] = float(v)
+                except Exception:
+                    metrics_noisy[k] = 0.0
 
         c = float(coherence) + float(rng.normal(0.0, noise_scale))
         harmony = metrics_noisy.get("harmony", 0.0)
@@ -407,13 +408,13 @@ class AFDInfinityAMI:
         oscill = metrics_noisy.get("oscillation", 0.0)
         potential = metrics_noisy.get("potential", 0.0)
 
-        # Intent-specific behavior: identity or opinion
+        # Intent-specific behavior
         if intent == "identity":
             identity_reflection = self.generate_identity_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
             answer = "You are speaking to AFD∞-AMI — an algorithmic, auditable assistant. I am not conscious."
             return "\n\n".join([identity_reflection, "Answer:", answer])
 
-        # default knowledge template (e.g., 'life')
+        # Default knowledge template
         sections = []
         sections.append(("Definition", "Life is a self-maintaining, information-processing system that uses energy to sustain organized structure, replicate, and evolve over time."))
         criteria_text = (
@@ -487,17 +488,18 @@ class AFDInfinityAMI:
         return "\n\n".join([identity, capability + mem_line, "Learning & limits:", limits])
 
     def generate_reasoning_reflection(self, neutral_prompt: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None, verbosity: int = 1, seed: Optional[int] = None) -> str:
-        # This is safe, post-hoc, human-readable reasoning (not chain-of-thought)
         rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
         c = float(coherence)
-        h = float(metrics.get("harmony", 0.0))
-        ig = float(metrics.get("info_gradient", 0.0))
-        o = float(metrics.get("oscillation", 0.0))
-        phi = float(metrics.get("potential", 0.0))
+        h = float(metrics.get("harmony", 0.0)) if isinstance(metrics, dict) else 0.0
+        ig = float(metrics.get("info_gradient", 0.0)) if isinstance(metrics, dict) else 0.0
+        o = float(metrics.get("oscillation", 0.0)) if isinstance(metrics, dict) else 0.0
+        phi = float(metrics.get("potential", 0.0)) if isinstance(metrics, dict) else 0.0
+
         def cue_confidence(c): return "high" if c >= 0.8 else ("low" if c <= 0.35 else "moderate")
         def cue_agreement(h): return "strong agreement" if h >= 0.6 else ("mixed signals" if h <= 0.2 else "some agreement with nuances")
         def cue_info(ig): return "meaningful supporting detail available" if ig >= 0.5 else "limited supporting detail"
         def cue_stability(o): return "internal instability present" if o > 0.25 else "internal state reasonably stable"
+
         premises = [f"Neutral prompt: '{neutral_prompt}'.", f"Coefficients: alpha={self.alpha:.3f}, beta={self.beta:.3f}, gamma={self.gamma:.3f}, delta={self.delta:.3f}."]
         evidence = [f"Metrics: coherence={c:.3f}, harmony={h:.3f}, info_gradient={ig:.3f}, oscillation={o:.3f}, potential={phi:.3f}.", cue_agreement(h) + "; " + cue_info(ig) + ".", cue_stability(o) + "."]
         inferences = []
@@ -545,6 +547,59 @@ class AFDInfinityAMI:
             lines.append("")
             lines.append("Style note: use explicit uncertainty markers (Likely, Possible, Unclear).")
         return "\n".join(lines)
+
+    def generate_simulated_thinking_reflection(self, neutral_prompt: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None, max_steps: int = 5):
+        # Defensive implementation: ensure metrics are dict-like and values numeric
+        try:
+            c = float(coherence)
+        except Exception:
+            c = 0.0
+        try:
+            harmony = float(metrics.get("harmony", 0.0)) if isinstance(metrics, dict) else 0.0
+        except Exception:
+            harmony = 0.0
+        try:
+            info_grad = float(metrics.get("info_gradient", 0.0)) if isinstance(metrics, dict) else 0.0
+        except Exception:
+            info_grad = 0.0
+        try:
+            oscill = float(metrics.get("oscillation", 0.0)) if isinstance(metrics, dict) else 0.0
+        except Exception:
+            oscill = 0.0
+
+        lines = []
+        if c >= 0.8:
+            lines.append("Okay — I see a clear, coherent picture here.")
+        elif c <= 0.35:
+            lines.append("Hmm — signals look uncertain; I should be cautious.")
+        else:
+            lines.append("I have a moderately coherent signal; I'll balance clarity and caution.")
+        if harmony > 0.6:
+            lines.append("Multiple internal indicators align — focus on the main, consistent points.")
+        elif harmony < 0.2:
+            lines.append("There are mixed signals — I'll point out ambiguities where relevant.")
+        if info_grad > 0.5:
+            lines.append("There is useful informational content to include; I'll add supporting detail.")
+        else:
+            lines.append("I should keep this concise and emphasize the essentials.")
+        if oscill > 0.25:
+            lines.append("I detect instability in the internal proxy; avoid speculation and hedge claims.")
+        else:
+            lines.append("Internal state is relatively stable; I can be more direct.")
+        if memory_summary and memory_summary.get("count", 0) > 0:
+            try:
+                count = memory_summary.get("count")
+                avg_out = memory_summary.get("avg_outcome")
+                if avg_out is not None:
+                    lines.append(f"I recall {count} recent interactions (avg outcome ≈ {avg_out:.2f}) — calibrating tone accordingly.")
+                else:
+                    lines.append(f"I recall {count} recent interactions — I'll modestly adapt tone based on that history.")
+            except Exception:
+                pass
+        if len(lines) > max_steps:
+            lines = lines[:max_steps]
+        lines.append("Now I'll produce a concise, auditable answer below.")
+        return lines
 
     #
     # Feedback & learning (unchanged)
@@ -633,14 +688,10 @@ class AFDInfinityAMI:
             return False
 
     #
-    # Main respond (now accepts chat_context separately)
+    # Main respond (defensive around reflection generation)
     #
     def respond(self, prompt: str, renderer_mode: str = "afd", include_memory: bool = True, seed: Optional[int] = None, reasoning_verbosity: int = 1, chat_context: Optional[str] = None):
-        """
-        prompt: the current user message (NOT the full conversation dump)
-        chat_context: optional string containing recent conversation (for explainability only; not included in neutralization)
-        """
-        # Neutralize only the user prompt (do NOT pass chat_context into neutralizer)
+        # Neutralize only the user prompt
         if renderer_mode == "afd":
             neutral_prompt = self._rule_neutralize(prompt)
         else:
@@ -651,7 +702,7 @@ class AFDInfinityAMI:
         if not neutral_prompt:
             neutral_prompt = prompt.strip()
 
-        # Memory summary (kept separate)
+        # Memory summary
         memory_summary = None
         if include_memory:
             try:
@@ -693,7 +744,7 @@ class AFDInfinityAMI:
         coherence = float(self.alpha * h + self.beta * ig - self.gamma * o + self.delta * phi)
         metrics = {"harmony": float(h), "info_gradient": float(ig), "oscillation": float(o), "potential": float(phi)}
 
-        # conservative memory nudges
+        # Memory-driven tiny nudges
         try:
             if memory_summary and memory_summary.get("avg_outcome") is not None:
                 avg_hist = memory_summary.get("avg_outcome")
@@ -720,30 +771,57 @@ class AFDInfinityAMI:
             "The renderer must use ONLY the neutral input and the numeric AFD metrics above to construct the response."
         )
 
-        # detect intent from neutral_prompt
         detected_intent = self._detect_intent(neutral_prompt)
 
-        # reflections (safe)
-        reasoning_reflection_text = self.generate_reasoning_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary, verbosity=reasoning_verbosity, seed=seed)
-        simulated_thinking = self.generate_simulated_thinking_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
-        human_reflection = self.generate_human_style_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
-        identity_reflection = self.generate_identity_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
+        # Defensive reflection generation: each helper is called inside try/except so failures don't crash respond()
+        try:
+            reasoning_reflection_text = self.generate_reasoning_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary, verbosity=reasoning_verbosity, seed=seed)
+        except Exception as e:
+            reasoning_reflection_text = ""
+            self.reflection_log.append(f"Reflection generation (reasoning) failed: {e}")
 
-        # Rendering: if opinion intent, we will produce reasoning_reflection_text + answer
+        try:
+            simulated_thinking = self.generate_simulated_thinking_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
+        except Exception as e:
+            simulated_thinking = []
+            self.reflection_log.append(f"Reflection generation (simulated_thinking) failed: {e}")
+
+        try:
+            human_reflection = self.generate_human_style_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
+        except Exception as e:
+            human_reflection = ""
+            self.reflection_log.append(f"Reflection generation (human) failed: {e}")
+
+        try:
+            identity_reflection = self.generate_identity_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
+        except Exception as e:
+            identity_reflection = ""
+            self.reflection_log.append(f"Reflection generation (identity) failed: {e}")
+
+        # Rendering
         if renderer_mode == "afd":
-            final_text = self._afd_renderer(neutral_prompt, afd_directives, metrics, coherence, memory_summary=memory_summary, seed=seed, intent=detected_intent, chat_context=chat_context)
-            renderer_used = "AFD (deterministic)"
+            try:
+                final_text = self._afd_renderer(neutral_prompt, afd_directives, metrics, coherence, memory_summary=memory_summary, seed=seed, intent=detected_intent, chat_context=chat_context)
+            except Exception as e:
+                final_text = ""
+                self.reflection_log.append(f"AFD renderer failed: {e}")
         else:
-            if self.use_openai:
-                final_text = self._render_with_openai(neutral_prompt, afd_directives)
-                renderer_used = "OpenAI"
-            else:
-                final_text = self._render_with_hf(neutral_prompt, afd_directives)
-                renderer_used = "HF"
+            try:
+                if self.use_openai:
+                    final_text = self._render_with_openai(neutral_prompt, afd_directives)
+                else:
+                    final_text = self._render_with_hf(neutral_prompt, afd_directives)
+            except Exception as e:
+                final_text = ""
+                self.reflection_log.append(f"LLM renderer failed: {e}")
 
-        # If the user explicitly asked for "thoughts"/opinion, put the safe reasoning reflection before the answer
+        # If opinion intent, prepend reasoning reflection safely
         if detected_intent == "opinion":
-            final_text = reasoning_reflection_text + "\n\nAnswer:\n" + (final_text or "")
+            if reasoning_reflection_text:
+                final_text = reasoning_reflection_text + "\n\nAnswer:\n" + (final_text or "")
+        # If identity intent and rendered by non-intent path, prefer generated identity_reflection
+        if detected_intent == "identity" and final_text and "Definition:" in final_text and identity_reflection:
+            final_text = identity_reflection + "\n\nAnswer:\n" + final_text
 
         # persist & explainability
         timestamp_iso = datetime.datetime.utcnow().isoformat()
@@ -758,7 +836,7 @@ class AFDInfinityAMI:
             "neutral_prompt": neutral_prompt,
             "chat_context": chat_context,
             "detected_intent": detected_intent,
-            "renderer_used": renderer_used,
+            "renderer_used": "AFD" if renderer_mode == "afd" else "LLM",
             "renderer_prompt": afd_directives,
             "sentiment_label": sentiment_label,
             "sentiment_score": float(sentiment_score),
@@ -783,10 +861,11 @@ class AFDInfinityAMI:
         except Exception:
             pass
 
-        afd_reflection = self.generate_afd_reflection(prompt, neutral_prompt, state, action, s_prime, interp_s, metrics, coherence, renderer_used)
+        afd_reflection = self.generate_afd_reflection(prompt, neutral_prompt, state, action, s_prime, interp_s, metrics, coherence, "AFD" if renderer_mode == "afd" else "LLM")
         try:
             self.reflection_log.append(afd_reflection)
         except Exception:
             self.reflection_log = [afd_reflection]
 
         return final_text, coherence, afd_reflection, timestamp_iso
+    
