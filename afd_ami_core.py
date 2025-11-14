@@ -1,11 +1,14 @@
 """
-AFDInfinityAMI - AFD-driven assistant core with intent detection, safe reflections, learning,
-and chat-history persistence.
+AFDInfinityAMI - AFD-driven assistant core with intent detection, safe reflections,
+chat-context separation (avoid echoing), and conservative learning.
 
-This file extends the previous AFD core with small chat-history helpers so the app can
-implement continuous chat. The AFD rendering and learning behavior remain deterministic
-and safe: no chain-of-thought is exposed, and any "reasoning reflection" is a post-hoc,
-auditable summary derived from numeric metrics and memory aggregates.
+Key changes:
+- respond(...) now accepts chat_context (string); the agent neutralizes only the user message
+  and does NOT include the conversation dump into the neutral prompt.
+- detect 'opinion' intent (e.g., "what are your thoughts on X") and, for that intent, prepend
+  the safe, post-hoc reasoning_reflection to the answer.
+- explainability now contains detected_intent and chat_context for auditing.
+- _afd_renderer takes an 'intent' parameter to let identity/opinion queries use specific templates.
 """
 from typing import Optional
 import os
@@ -30,11 +33,10 @@ except Exception:
 
 class AFDInfinityAMI:
     def __init__(self, use_openai: bool = False, openai_api_key: Optional[str] = None, temperature: float = 0.0, memory_window: int = 20):
-        # runtime params
         self.temperature = float(temperature or 0.0)
         self.memory_window = int(memory_window or 20)
 
-        # OpenAI key (normalized)
+        # OpenAI key handling
         raw_key = openai_api_key or None
         try:
             if raw_key is None and hasattr(st, "secrets"):
@@ -43,22 +45,19 @@ class AFDInfinityAMI:
             raw_key = raw_key
         if raw_key is None:
             raw_key = os.getenv("OPENAI_API_KEY")
-
         api_key = None
         if raw_key:
             api_key = str(raw_key).strip()
             if (api_key.startswith('"') and api_key.endswith('"')) or (api_key.startswith("'") and api_key.endswith("'")):
                 api_key = api_key[1:-1].strip()
-
         self.use_openai = bool(api_key) or bool(use_openai)
         if api_key:
             openai.api_key = api_key
 
-        # internal logs and explainability
+        # logs & persistence
         self.reflection_log = []
         self.latest_explainability = None
 
-        # persistence files
         self.memory_file = "data/response_log.csv"
         self.explain_file = "data/explain_log.jsonl"
         self.chat_file = "data/chat_history.jsonl"
@@ -68,13 +67,11 @@ class AFDInfinityAMI:
                 self.memory_file, index=False, encoding="utf-8-sig"
             )
 
-        # AFD coefficients (learnable)
+        # coefficients & learning
         self.alpha = 1.0
         self.beta = 1.0
         self.gamma = 0.5
         self.delta = 0.5
-
-        # conservative learning hyperparams
         self._learning_rate = 0.02
         self._coeff_min, self._coeff_max = -2.0, 4.0
 
@@ -86,7 +83,6 @@ class AFDInfinityAMI:
         self._hf_llm = None
         self.sentiment_analyzer = None
 
-        # silent OpenAI test
         if self.use_openai and api_key:
             try:
                 self._test_openai_key()
@@ -100,7 +96,7 @@ class AFDInfinityAMI:
         return True
 
     #
-    # HF caching (lazy)
+    # HF caching
     #
     @st.cache_resource
     def _cache_llm(_self):
@@ -137,7 +133,7 @@ class AFDInfinityAMI:
         return self.sentiment_analyzer
 
     #
-    # Neutralization
+    # Neutralizers
     #
     def _rule_neutralize(self, user_input: str) -> str:
         s = (user_input or "").strip()
@@ -225,18 +221,24 @@ class AFDInfinityAMI:
     #
     def _detect_intent(self, neutral_prompt: str) -> str:
         nprompt = (neutral_prompt or "").lower().strip()
+        # identity patterns
         if re.search(r"\b(who (am i|are you|is this|am i speaking to|am i talking to)|are you a|who are you)\b", nprompt):
             return "identity"
         if re.search(r"\b(agent identity|agent identity inquiry|identity inquiry)\b", nprompt):
             return "identity"
+        # opinion/thoughts request
+        if re.search(r"\b(your thoughts|what are your thoughts|what do you think|your view|what's your view)\b", nprompt):
+            return "opinion"
+        # definition patterns
         if re.match(r"^(definition|definition/explanation request:|what is|what are)\b", nprompt):
             return "definition"
+        # explain/descriptive
         if nprompt.startswith(("explain ", "describe ", "summarize ", "compare ", "tell me about ")):
             return "explain"
         return "unknown"
 
     #
-    # AFD math
+    # AFD math + helpers
     #
     def predict_next_state(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
         return state + np.random.normal(0, 0.1, state.shape)
@@ -279,7 +281,7 @@ class AFDInfinityAMI:
         return max(lo, min(hi, float(v)))
 
     #
-    # Persistence helpers (memory & chat)
+    # Persistence + chat helpers
     #
     def save_memory(self, prompt: str, neutral_prompt: str, response: str, coherence: float, timestamp_iso: str, outcome: Optional[float] = None, outcome_comment: Optional[str] = None):
         try:
@@ -312,10 +314,6 @@ class AFDInfinityAMI:
             self.reflection_log.append(f"Warning: Could not append explainability JSONL ({e}).")
 
     def append_chat_entry(self, role: str, message: str, timestamp_iso: Optional[str] = None):
-        """
-        Append a chat turn to a chat_history.jsonl file for audit and to drive continuous chat UI.
-        role: 'user' or 'assistant' or other
-        """
         try:
             os.makedirs(os.path.dirname(self.chat_file) or ".", exist_ok=True)
             ts = timestamp_iso or datetime.datetime.utcnow().isoformat()
@@ -326,9 +324,6 @@ class AFDInfinityAMI:
             self.reflection_log.append(f"Warning: Could not append chat entry ({e}).")
 
     def load_chat_history(self, n: Optional[int] = None):
-        """
-        Return the last n chat entries (list of dicts). If file missing, returns [].
-        """
         try:
             if not os.path.exists(self.chat_file):
                 return []
@@ -356,9 +351,6 @@ class AFDInfinityAMI:
 
     def get_last_explainability(self) -> Optional[dict]:
         return getattr(self, "latest_explainability", None)
-
-    def get_latest_reflection(self) -> str:
-        return self.reflection_log[-1] if self.reflection_log else "No reflections yet."
 
     #
     # Memory summarization
@@ -394,14 +386,14 @@ class AFDInfinityAMI:
         return {"count": len(tail), "avg_coherence": avg_coh, "avg_outcome": avg_out, "last_neutral_prompts": last_neutrals, "top_tokens": top_tokens}
 
     #
-    # AFD deterministic renderer
+    # Deterministic AFD renderer (no LLM). Accepts an 'intent' and 'chat_context' to avoid echo.
     #
-    def _afd_renderer(self, neutral_prompt: str, afd_directives: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None, seed: Optional[int] = None) -> str:
+    def _afd_renderer(self, neutral_prompt: str, afd_directives: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None, seed: Optional[int] = None, intent: Optional[str] = None, chat_context: Optional[str] = None) -> str:
         rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
         temp = float(max(0.0, min(self.temperature, 3.0)))
         noise_scale = max(0.0, temp * 0.06)
 
-        # perturb numeric metrics slightly
+        # perturb metrics
         metrics_noisy = {}
         for k, v in metrics.items():
             try:
@@ -415,16 +407,13 @@ class AFDInfinityAMI:
         oscill = metrics_noisy.get("oscillation", 0.0)
         potential = metrics_noisy.get("potential", 0.0)
 
-        # Detect intent and choose appropriate template if identity
-        intent = self._detect_intent(neutral_prompt)
+        # Intent-specific behavior: identity or opinion
         if intent == "identity":
-            # deterministic identity answer
             identity_reflection = self.generate_identity_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
-            answer = "You are speaking to AFD∞-AMI — an algorithmic assistant (not conscious). I neutralize prompts, compute internal AFD metrics, produce auditable answers, and accept explicit feedback to learn conservatively."
-            lines = [identity_reflection, "", "Answer:", answer]
-            return "\n".join(lines)
+            answer = "You are speaking to AFD∞-AMI — an algorithmic, auditable assistant. I am not conscious."
+            return "\n\n".join([identity_reflection, "Answer:", answer])
 
-        # Build section list based on thresholds (default knowledge templates)
+        # default knowledge template (e.g., 'life')
         sections = []
         sections.append(("Definition", "Life is a self-maintaining, information-processing system that uses energy to sustain organized structure, replicate, and evolve over time."))
         criteria_text = (
@@ -453,7 +442,6 @@ class AFDInfinityAMI:
             lines.append(f"{title}:")
             lines.append(body)
             lines.append("")
-
         lines.append("AFD rationale (derived):")
         lines.append(f"- coherence: {c:.4f}")
         lines.append(f"- harmony: {harmony:.4f}, info_gradient: {info_grad:.4f}, oscillation: {oscill:.4f}, potential: {potential:.4f}")
@@ -463,10 +451,8 @@ class AFDInfinityAMI:
             lines.append("- Overall: uncertainty present — cautious, hedged explanation.")
         else:
             lines.append("- Overall: moderate coherence — balanced explanation with clarifications.")
-
         if memory_summary and memory_summary.get("avg_outcome") is not None:
             lines.append(f"- Memory note: recent average outcome={memory_summary.get('avg_outcome'):.3f} (calibrates tone).")
-
         lines.append("")
         lines.append("Answer synthesis:")
         if c >= 0.8:
@@ -483,7 +469,7 @@ class AFDInfinityAMI:
         return "\n".join(lines)
 
     #
-    # Safe reflections (identity, human, simulated thinking, reasoning)
+    # Safe reflections
     #
     def generate_identity_reflection(self, neutral_prompt: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None) -> str:
         identity = "I am AFD∞-AMI, an algorithmic assistant. I am not conscious; I neutralize prompts, compute AFD metrics, compose auditable answers, and learn conservatively from explicit feedback."
@@ -500,68 +486,18 @@ class AFDInfinityAMI:
         limits = "I do not reveal chain-of-thought. Reflections are post-hoc summaries derived from numeric metrics and aggregated memory."
         return "\n\n".join([identity, capability + mem_line, "Learning & limits:", limits])
 
-    def generate_human_style_reflection(self, neutral_prompt: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None) -> str:
-        c = float(coherence)
-        h = float(metrics.get("harmony", 0.0))
-        ig = float(metrics.get("info_gradient", 0.0))
-        o = float(metrics.get("oscillation", 0.0))
-        parts = ["I am an algorithmic assistant. I do not possess consciousness but I can summarize how I assessed this request."]
-        parts.append(f"- Neutral input: {neutral_prompt}")
-        parts.append(f"- Assessment: coherence={c:.3f}; harmony={h:.3f}, info_grad={ig:.3f}, oscill={o:.3f}.")
-        if memory_summary and memory_summary.get("count", 0) > 0:
-            parts.append(f"- Memory: {memory_summary.get('count')} recent entries; avg outcome={memory_summary.get('avg_outcome')}.")
-        parts.append("This summary explains how numeric metrics shaped the answer.")
-        return "\n".join(parts)
-
-    def generate_simulated_thinking_reflection(self, neutral_prompt: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None, max_steps: int = 5):
-        c = float(coherence)
-        h = float(metrics.get("harmony", 0.0))
-        ig = float(metrics.get("info_gradient", 0.0))
-        o = float(metrics.get("oscillation", 0.0))
-        lines = []
-        if c >= 0.8:
-            lines.append("Okay — I see a clear, coherent picture here.")
-        elif c <= 0.35:
-            lines.append("Hmm — signals look uncertain; I should be cautious.")
-        else:
-            lines.append("I have a moderately coherent signal; I'll balance clarity and caution.")
-        if h > 0.6:
-            lines.append("Multiple indicators align — focus on consistent points.")
-        elif h < 0.2:
-            lines.append("There are mixed signals — I'll highlight ambiguities.")
-        if ig > 0.5:
-            lines.append("Useful supporting detail available; include it.")
-        else:
-            lines.append("Keep this concise; emphasize essentials.")
-        if o > 0.25:
-            lines.append("Instability detected — avoid speculation.")
-        else:
-            lines.append("Internal state relatively stable — be direct.")
-        if memory_summary and memory_summary.get("count", 0) > 0:
-            count = memory_summary.get("count")
-            avg_out = memory_summary.get("avg_outcome")
-            if avg_out is not None:
-                lines.append(f"Recall {count} recent interactions (avg outcome ≈ {avg_out:.2f}) — calibrating tone.")
-            else:
-                lines.append(f"Recall {count} recent interactions — calibrating modestly.")
-        if len(lines) > max_steps:
-            lines = lines[:max_steps]
-        lines.append("Now I'll produce a concise, auditable answer below.")
-        return lines
-
     def generate_reasoning_reflection(self, neutral_prompt: str, metrics: dict, coherence: float, memory_summary: Optional[dict] = None, verbosity: int = 1, seed: Optional[int] = None) -> str:
+        # This is safe, post-hoc, human-readable reasoning (not chain-of-thought)
         rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
         c = float(coherence)
         h = float(metrics.get("harmony", 0.0))
         ig = float(metrics.get("info_gradient", 0.0))
         o = float(metrics.get("oscillation", 0.0))
         phi = float(metrics.get("potential", 0.0))
-
         def cue_confidence(c): return "high" if c >= 0.8 else ("low" if c <= 0.35 else "moderate")
         def cue_agreement(h): return "strong agreement" if h >= 0.6 else ("mixed signals" if h <= 0.2 else "some agreement with nuances")
         def cue_info(ig): return "meaningful supporting detail available" if ig >= 0.5 else "limited supporting detail"
         def cue_stability(o): return "internal instability present" if o > 0.25 else "internal state reasonably stable"
-
         premises = [f"Neutral prompt: '{neutral_prompt}'.", f"Coefficients: alpha={self.alpha:.3f}, beta={self.beta:.3f}, gamma={self.gamma:.3f}, delta={self.delta:.3f}."]
         evidence = [f"Metrics: coherence={c:.3f}, harmony={h:.3f}, info_gradient={ig:.3f}, oscillation={o:.3f}, potential={phi:.3f}.", cue_agreement(h) + "; " + cue_info(ig) + ".", cue_stability(o) + "."]
         inferences = []
@@ -581,10 +517,8 @@ class AFDInfinityAMI:
             mem_note += " modestly inform tone."
             inferences.append(mem_note)
         uncertainty = ["Key uncertainties: internal signals unstable or low coherence; flag ambiguity."] if (o > 0.25 or c <= 0.35) else ["Key uncertainties: limited; main points supported."]
-
         if verbosity == 0:
             return "Conclusion: provide a concise factual answer." if conf == "high" else "Conclusion: provide a cautious, qualified answer."
-
         lines = []
         lines.append(f"(Thinking) Detected {conf} confidence from metrics.")
         lines.append("")
@@ -613,7 +547,7 @@ class AFDInfinityAMI:
         return "\n".join(lines)
 
     #
-    # Feedback / learning (unchanged from previous)
+    # Feedback & learning (unchanged)
     #
     def provide_feedback(self, entry_timestamp: str, outcome_score: float, outcome_comment: Optional[str] = None) -> bool:
         try:
@@ -623,7 +557,6 @@ class AFDInfinityAMI:
         except Exception as e:
             self.reflection_log.append(f"Feedback invalid: {e}")
             return False
-
         updated = False
         try:
             df = pd.read_csv(self.memory_file, encoding="utf-8-sig")
@@ -635,7 +568,6 @@ class AFDInfinityAMI:
                 updated = True
         except Exception as e:
             self.reflection_log.append(f"Feedback CSV update failed: {e}")
-
         found = None
         try:
             if os.path.exists(self.explain_file):
@@ -659,14 +591,12 @@ class AFDInfinityAMI:
             if found is None:
                 self.reflection_log.append(f"Feedback: explainability not found for {entry_timestamp}")
                 return False
-
             feedback_record = {"timestamp": datetime.datetime.utcnow().isoformat(), "feedback_for": entry_timestamp, "outcome": score, "comment": outcome_comment}
             try:
                 with open(self.explain_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps({"_feedback": feedback_record}, ensure_ascii=False) + "\n")
             except Exception:
                 pass
-
             metrics = found.get("afd_metrics", {})
             h = float(metrics.get("harmony", 0.0))
             ig = float(metrics.get("info_gradient", 0.0))
@@ -677,7 +607,6 @@ class AFDInfinityAMI:
         except Exception as e:
             self.reflection_log.append(f"Feedback processing error: {e}")
             return False
-
         if updated:
             self.reflection_log.append(f"Feedback recorded for {entry_timestamp}: score={score}")
         return True
@@ -704,10 +633,14 @@ class AFDInfinityAMI:
             return False
 
     #
-    # respond: main entry point (compatible with continuous chat usage)
+    # Main respond (now accepts chat_context separately)
     #
-    def respond(self, prompt: str, renderer_mode: str = "afd", include_memory: bool = True, seed: Optional[int] = None, reasoning_verbosity: int = 1):
-        # Neutralize (rule for afd mode; LLM for 'llm')
+    def respond(self, prompt: str, renderer_mode: str = "afd", include_memory: bool = True, seed: Optional[int] = None, reasoning_verbosity: int = 1, chat_context: Optional[str] = None):
+        """
+        prompt: the current user message (NOT the full conversation dump)
+        chat_context: optional string containing recent conversation (for explainability only; not included in neutralization)
+        """
+        # Neutralize only the user prompt (do NOT pass chat_context into neutralizer)
         if renderer_mode == "afd":
             neutral_prompt = self._rule_neutralize(prompt)
         else:
@@ -718,7 +651,7 @@ class AFDInfinityAMI:
         if not neutral_prompt:
             neutral_prompt = prompt.strip()
 
-        # Memory summarization
+        # Memory summary (kept separate)
         memory_summary = None
         if include_memory:
             try:
@@ -760,7 +693,7 @@ class AFDInfinityAMI:
         coherence = float(self.alpha * h + self.beta * ig - self.gamma * o + self.delta * phi)
         metrics = {"harmony": float(h), "info_gradient": float(ig), "oscillation": float(o), "potential": float(phi)}
 
-        # Memory-driven tiny nudges
+        # conservative memory nudges
         try:
             if memory_summary and memory_summary.get("avg_outcome") is not None:
                 avg_hist = memory_summary.get("avg_outcome")
@@ -786,27 +719,33 @@ class AFDInfinityAMI:
             f"Coefficients: alpha={self.alpha:.3f}, beta={self.beta:.3f}, gamma={self.gamma:.3f}, delta={self.delta:.3f}\n"
             "The renderer must use ONLY the neutral input and the numeric AFD metrics above to construct the response."
         )
-        renderer_prompt = afd_directives  # for explainability we already store afd_directives
 
-        # reflections
+        # detect intent from neutral_prompt
+        detected_intent = self._detect_intent(neutral_prompt)
+
+        # reflections (safe)
         reasoning_reflection_text = self.generate_reasoning_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary, verbosity=reasoning_verbosity, seed=seed)
         simulated_thinking = self.generate_simulated_thinking_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
         human_reflection = self.generate_human_style_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
         identity_reflection = self.generate_identity_reflection(neutral_prompt, metrics, coherence, memory_summary=memory_summary)
 
-        # rendering (AFD or LLM)
+        # Rendering: if opinion intent, we will produce reasoning_reflection_text + answer
         if renderer_mode == "afd":
-            final_text = self._afd_renderer(neutral_prompt, renderer_prompt, metrics, coherence, memory_summary=memory_summary, seed=seed)
+            final_text = self._afd_renderer(neutral_prompt, afd_directives, metrics, coherence, memory_summary=memory_summary, seed=seed, intent=detected_intent, chat_context=chat_context)
             renderer_used = "AFD (deterministic)"
         else:
             if self.use_openai:
-                final_text = self._render_with_openai(neutral_prompt, renderer_prompt)
+                final_text = self._render_with_openai(neutral_prompt, afd_directives)
                 renderer_used = "OpenAI"
             else:
-                final_text = self._render_with_hf(neutral_prompt, renderer_prompt)
+                final_text = self._render_with_hf(neutral_prompt, afd_directives)
                 renderer_used = "HF"
 
-        # timestamp and persist
+        # If the user explicitly asked for "thoughts"/opinion, put the safe reasoning reflection before the answer
+        if detected_intent == "opinion":
+            final_text = reasoning_reflection_text + "\n\nAnswer:\n" + (final_text or "")
+
+        # persist & explainability
         timestamp_iso = datetime.datetime.utcnow().isoformat()
         try:
             self.save_memory(prompt, neutral_prompt, final_text, coherence, timestamp_iso)
@@ -817,8 +756,10 @@ class AFDInfinityAMI:
             "timestamp": timestamp_iso,
             "original_prompt": prompt,
             "neutral_prompt": neutral_prompt,
+            "chat_context": chat_context,
+            "detected_intent": detected_intent,
             "renderer_used": renderer_used,
-            "renderer_prompt": renderer_prompt,
+            "renderer_prompt": afd_directives,
             "sentiment_label": sentiment_label,
             "sentiment_score": float(sentiment_score),
             "state": state.tolist(),
@@ -834,7 +775,6 @@ class AFDInfinityAMI:
             "identity_reflection": identity_reflection,
             "simulated_thinking": simulated_thinking,
             "reasoning_reflection": reasoning_reflection_text,
-            "detected_intent": self._detect_intent(neutral_prompt),
         }
 
         self.latest_explainability = explainability
@@ -850,30 +790,3 @@ class AFDInfinityAMI:
             self.reflection_log = [afd_reflection]
 
         return final_text, coherence, afd_reflection, timestamp_iso
-
-    #
-    # Structured AFD reflection
-    #
-    def generate_afd_reflection(self, prompt, neutral_prompt, state, action, s_prime, interp_s, metrics, coherence, renderer_used):
-        lines = []
-        lines.append("AFD Reflection:")
-        lines.append(f"- original_prompt: {prompt}")
-        lines.append(f"- neutral_prompt: {neutral_prompt}")
-        lines.append(f"- state (proxy): {np.array(state).tolist()}")
-        lines.append(f"- action proxy: {np.array(action).tolist()}")
-        lines.append(f"- predicted s_prime: {np.array(s_prime).tolist()}")
-        lines.append(f"- interp_s: {np.array(interp_s).tolist()}")
-        lines.append(
-            f"- afd_metrics: harmony={metrics.get('harmony'):.6f}, info_gradient={metrics.get('info_gradient'):.6f}, "
-            f"oscillation={metrics.get('oscillation'):.6f}, potential={metrics.get('potential'):.6f}"
-        )
-        lines.append(f"- coherence: {coherence:.6f}")
-        if coherence < 0.4:
-            lines.append("- Rationale: Low coherence -> prioritized neutrality and highlighted uncertainty.")
-        elif coherence > 0.8:
-            lines.append("- Rationale: High coherence -> confident, concise explanation.")
-        else:
-            lines.append("- Rationale: Moderate coherence -> balanced, cautious explanation.")
-        lines.append(f"- renderer_used: {renderer_used}")
-        lines.append(f"- coefficients: alpha={self.alpha:.3f}, beta={self.beta:.3f}, gamma={self.gamma:.3f}, delta={self.delta:.3f}")
-        return "\n".join(lines)
