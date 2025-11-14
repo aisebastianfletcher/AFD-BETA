@@ -868,4 +868,3 @@ class AFDInfinityAMI:
             self.reflection_log = [afd_reflection]
 
         return final_text, coherence, afd_reflection, timestamp_iso
-    
