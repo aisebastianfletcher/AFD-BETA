@@ -1,7 +1,10 @@
-# Streamlit UI — professional continuous chat with clean back-and-forth view
-# - Sidebar contains controls
-# - Main chat pane shows a linear conversation (no repeated dumps)
-# - Per-assistant-message expander reveals reflections/explainability (kept out of the way by default)
+# app.py
+"""
+Streamlit UI: professional continuous chat layout for AFD∞-AMI
+- Sidebar holds controls (renderer, temperature, memory options)
+- Main pane displays linear conversation with per-assistant explainability expanders
+- Chat stored in session_state and persisted to data/chat_history.jsonl
+"""
 import streamlit as st
 import traceback
 import os
@@ -15,13 +18,13 @@ st.title("AFD∞-AMI — Continuous Chat (AFD-driven, auditable)")
 
 # Import agent
 import_error = None
-AFDInfinityAMI = None
 try:
     from afd_ami_core import AFDInfinityAMI  # type: ignore
-except Exception:
+except Exception as e:
     import_error = traceback.format_exc()
+    AFDInfinityAMI = None
 
-# Sidebar controls (clean)
+# Sidebar controls
 with st.sidebar:
     st.header("Settings")
     prefer_openai = st.checkbox("Prefer OpenAI (LLM rendering)", value=False)
@@ -39,7 +42,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Reflections")
-    show_thinking_animation = st.checkbox("Show thinking animation (short)", value=False)
+    show_thinking_animation = st.checkbox("Show thinking animation", value=False)
     show_reasoning_reflection = st.checkbox("Show reasoning reflection pre-answer", value=False)
     reasoning_verbosity = st.selectbox("Reasoning verbosity", ["brief", "normal", "expanded"], index=1)
     verbosity_setting = 0 if reasoning_verbosity == "brief" else (2 if reasoning_verbosity == "expanded" else 1)
@@ -54,18 +57,18 @@ with st.sidebar:
 
     st.markdown("---")
     if import_error:
-        st.error("Error importing afd_ami_core.py (open Debug).")
-    st.caption("Most controls are session-scoped. Preferences can be made persistent by editing code.")
+        st.error("Error importing afd_ami_core.py (see Debug).")
+    st.caption("Settings are session-scoped. To persist change code in the repo.")
 
 # Debug expander
 with st.expander("Debug", expanded=False):
     st.write("Import OK:", import_error is None)
     if import_error:
         st.exception(import_error)
-    st.write("Data persisted in ./data (memory, explainability, chat_history.jsonl)")
+    st.write("Data persisted in ./data (memory, explainability, chat_history.jsonl).")
 
-# Instantiate agent
-if import_error:
+# Instantiate agent (or stub)
+if import_error or AFDInfinityAMI is None:
     class _StubAMI:
         def __init__(self):
             self.use_openai = False
@@ -74,7 +77,7 @@ if import_error:
             self.gamma = self.delta = 0.5
         def respond(self, prompt, renderer_mode="afd", include_memory=True, seed=None, reasoning_verbosity=1, chat_context=None):
             ts = pd.Timestamp.utcnow().isoformat()
-            return "Agent unavailable (import error).", 0.0, "AFD Reflection (stub)", ts
+            return "Agent not available (import error).", 0.0, "AFD Reflection (stub)", ts
         def append_chat_entry(self, role, message, timestamp_iso=None):
             return
         def provide_feedback(self, entry_timestamp, outcome_score, outcome_comment=None):
@@ -86,14 +89,14 @@ if import_error:
     ami = _StubAMI()
 else:
     try:
-        ami = AFDInfinityAMI(use_openai=prefer_openai, temperature=temperature, memory_window=int(memory_window))
+        ami = AFDInfinityAMI(use_openai=prefer_openai, openai_api_key=None, temperature=temperature, memory_window=int(memory_window))
     except Exception as e:
         st.error("Agent instantiation failed; using stub.")
         st.exception(e)
         class _StubAMI2:
             def __init__(self):
                 self.use_openai = False
-                self.reflection_log = ["stub"]
+                self.reflection_log = ["stub2"]
                 self.alpha = self.beta = 1.0
                 self.gamma = self.delta = 0.5
             def respond(self, prompt, renderer_mode="afd", include_memory=True, seed=None, reasoning_verbosity=1, chat_context=None):
@@ -109,11 +112,11 @@ else:
                 return None
         ami = _StubAMI2()
 
-# Ensure session chat history exists
+# Session chat history
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []  # list of dicts: {role, message, ts, explain}
 
-# Small helper functions
+# Helper functions
 def is_greeting(text: str) -> bool:
     if not text:
         return False
@@ -129,81 +132,68 @@ def build_context_from_session(n: int):
             parts.append(f"{role.upper()}: {msg}")
     return "\n".join(parts)
 
-# Main layout: chat column + side column
-main_col, right_col = st.columns([3, 1])
-
+# Chat rendering
 def render_chat(history):
-    with main_col:
-        st.markdown("### Conversation")
-        if not history:
-            st.info("No messages yet — send a message to start.")
-            return
-        for turn in history[-200:]:
-            role = turn.get("role", "user")
-            msg = turn.get("message", "")
-            ts = turn.get("ts", "")
-            explain = turn.get("explain")
-            if role == "user":
-                cols = st.columns([1, 4])
-                with cols[0]:
-                    st.markdown(f"**You**")
-                with cols[1]:
-                    st.markdown(f"> {msg}")
-            else:
-                cols = st.columns([1, 4])
-                with cols[0]:
-                    st.markdown(f"**Assistant**")
-                with cols[1]:
-                    st.markdown(msg)
-                # per-message explainability expander (keeps reflections out of the main flow)
-                if explain and isinstance(explain, dict):
-                    with cols[1].expander("Show assistant reflections & metrics", expanded=False):
-                        st.markdown("**Detected intent:** " + str(explain.get("detected_intent", "N/A")))
-                        if explain.get("reasoning_reflection"):
-                            st.markdown("**Reasoning (post-hoc):**")
-                            st.code(explain.get("reasoning_reflection"))
-                        if explain.get("human_reflection"):
-                            st.markdown("**Human-style reflection:**")
-                            st.write(explain.get("human_reflection"))
-                        if explain.get("identity_reflection"):
-                            st.markdown("**Identity reflection:**")
-                            st.write(explain.get("identity_reflection"))
-                        st.markdown("**AFD metrics & coefficients**")
-                        st.json({"coherence": explain.get("coherence"), "afd_metrics": explain.get("afd_metrics"), "coefficients": explain.get("coefficients")})
+    st.markdown("### Conversation")
+    if not history:
+        st.info("No messages yet — send a message to start.")
+        return
+    for turn in history[-200:]:
+        role = turn.get("role", "user")
+        msg = turn.get("message", "")
+        ts = turn.get("ts", "")
+        explain = turn.get("explain")
+        if role == "user":
+            cols = st.columns([1, 4])
+            with cols[0]:
+                st.markdown(f"**You**")
+            with cols[1]:
+                st.markdown(f"> {msg}")
+        else:
+            cols = st.columns([1, 4])
+            with cols[0]:
+                st.markdown(f"**Assistant**")
+            with cols[1]:
+                st.markdown(msg)
+            if explain and isinstance(explain, dict):
+                with cols[1].expander("Show assistant reflections & metrics", expanded=False):
+                    st.markdown("**Detected intent:** " + str(explain.get("detected_intent", "N/A")))
+                    if explain.get("reasoning_reflection"):
+                        st.markdown("**Reasoning (post-hoc):**")
+                        st.code(explain.get("reasoning_reflection"))
+                    if explain.get("human_reflection"):
+                        st.markdown("**Human-style reflection:**")
+                        st.write(explain.get("human_reflection"))
+                    if explain.get("identity_reflection"):
+                        st.markdown("**Identity reflection:**")
+                        st.write(explain.get("identity_reflection"))
+                    st.markdown("**AFD metrics & coefficients**")
+                    st.json({"coherence": explain.get("coherence"), "afd_metrics": explain.get("afd_metrics"), "coefficients": explain.get("coefficients")})
 
-# Render existing chat
+# initial render
 render_chat(st.session_state.chat_history)
 
-# Input area anchored below
-with main_col:
-    st.markdown("---")
-    if continuous_chat:
-        user_input = st.text_input("Message", key="chat_input")
-    else:
-        user_input = st.text_area("Single-turn prompt", value="", height=140)
-    send = st.button("Send")
+# Input area
+st.markdown("---")
+if continuous_chat:
+    user_input = st.text_input("Message", key="chat_input")
+else:
+    user_input = st.text_area("Single-turn prompt", value="", height=140)
+send = st.button("Send")
 
-# Tools on right column (compact)
-with right_col:
-    st.markdown("### Tools")
+# Tools & downloads
+with st.sidebar:
+    st.markdown("---")
     if st.button("Clear session chat"):
         st.session_state.chat_history = []
         st.success("Session chat cleared.")
     if st.button("Reload agent"):
         try:
-            ami = AFDInfinityAMI(use_openai=prefer_openai, temperature=temperature, memory_window=int(memory_window))
+            ami = AFDInfinityAMI(use_openai=prefer_openai, openai_api_key=None, temperature=temperature, memory_window=int(memory_window))
             st.success("Agent reloaded.")
         except Exception as e:
             st.error("Reload failed.")
             st.exception(e)
-    st.markdown("---")
-    st.markdown("### Last explainability")
-    last_explain = ami.get_last_explainability()
-    if last_explain:
-        st.write("Intent:", last_explain.get("detected_intent", "N/A"))
-        st.json({"coherence": last_explain.get("coherence"), "afd_metrics": last_explain.get("afd_metrics")})
-    else:
-        st.info("No explainability snapshot yet.")
     st.markdown("---")
     st.markdown("### Persisted files")
     if st.button("Download memory CSV"):
@@ -225,7 +215,6 @@ with right_col:
 
 # Send handling
 if send and user_input and user_input.strip():
-    # record user message
     ts_user = pd.Timestamp.utcnow().isoformat()
     st.session_state.chat_history.append({"role": "user", "message": user_input, "ts": ts_user})
     try:
@@ -233,18 +222,16 @@ if send and user_input and user_input.strip():
     except Exception:
         pass
 
-    # Build chat_context (for explainability only) from recent session turns
     context = ""
     if continuous_chat and chat_history_length > 0 and st.session_state.chat_history:
         context = build_context_from_session(chat_history_length)
 
-    # Greeting shortcut: map small greetings to identity prompt to avoid template confusion
+    # greeting shortcut
     if is_greeting(user_input):
         prompt_for_agent = "Who am I talking to?"
     else:
-        prompt_for_agent = user_input  # only current user message is sent as 'prompt'
+        prompt_for_agent = user_input
 
-    # Call agent (send only prompt, pass chat_context separately)
     try:
         response, coherence, afd_reflection, response_ts = ami.respond(
             prompt_for_agent,
@@ -255,67 +242,61 @@ if send and user_input and user_input.strip():
             chat_context=context,
         )
     except Exception as e:
-        st.error("Agent error")
+        st.error("Agent error during respond()")
         st.exception(e)
         response, coherence, afd_reflection, response_ts = "Error generating response.", 0.0, "Error", pd.Timestamp.utcnow().isoformat()
 
-    # Retrieve explain snapshot
     explain = ami.get_last_explainability() or {}
     final_text = response if response and str(response).strip() else (explain.get("final_text") or "")
 
-    # Greeting defense: if greeting override used but agent returned unrelated "life" template, prefer concise identity
+    # greeting defense
     if is_greeting(user_input):
-        identity_text = None
+        id_text = None
         if explain and explain.get("identity_reflection"):
-            identity_text = explain.get("identity_reflection") + "\n\nYou are speaking to AFD∞-AMI — an algorithmic assistant (not conscious)."
-        if not identity_text and final_text and "Definition:" in final_text and "Life" in final_text:
-            identity_text = "Hello — you are speaking to AFD∞-AMI, an algorithmic assistant. I process prompts with an auditable AFD pipeline and can learn from feedback."
-        if identity_text:
-            final_text = identity_text
+            id_text = explain.get("identity_reflection") + "\n\nYou are speaking to AFD∞-AMI — an algorithmic assistant (not conscious)."
+        if not id_text and final_text and "Definition:" in final_text and "Life" in final_text:
+            id_text = "Hello — you are speaking to AFD∞-AMI, an algorithmic assistant. I process prompts with an auditable AFD pipeline and can learn from feedback."
+        if id_text:
+            final_text = id_text
 
     if not final_text or not str(final_text).strip():
         final_text = "No answer was generated. Check hidden diagnostics."
 
-    # record assistant message (store explain snapshot for per-message expander)
+    # record assistant message
     st.session_state.chat_history.append({"role": "assistant", "message": final_text, "ts": response_ts, "explain": explain})
     try:
         ami.append_chat_entry("assistant", final_text, timestamp_iso=response_ts)
     except Exception:
         pass
 
-    # show a short thinking animation (optional)
+    # optional thinking animation
     if show_thinking_animation and explain and explain.get("simulated_thinking"):
-        thinking_lines = explain.get("simulated_thinking")
-        placeholder = st.empty()
-        for tline in thinking_lines:
-            placeholder.markdown(f"*Thinking...* {tline}")
+        pl = st.empty()
+        for tline in explain.get("simulated_thinking"):
+            pl.markdown(f"*Thinking...* {tline}")
             time.sleep(0.14)
-        placeholder.empty()
+        pl.empty()
 
-    # optionally show reasoning reflection before answer (if user requested)
     if show_reasoning_reflection and explain and explain.get("reasoning_reflection"):
-        with main_col:
-            st.markdown("**Reasoning (safe, post-hoc):**")
-            st.code(explain.get("reasoning_reflection"))
+        st.markdown("**Reasoning (safe, post-hoc):**")
+        st.code(explain.get("reasoning_reflection"))
 
-    # refresh chat display
     render_chat(st.session_state.chat_history)
 
-    # present AFD reflection compact + feedback controls
-    with main_col:
-        st.markdown("---")
-        st.markdown("**AFD reflection (authoritative)**")
-        st.code(afd_reflection)
+    # show afd reflection & feedback controls
+    st.markdown("---")
+    st.markdown("**AFD reflection (authoritative)**")
+    st.code(afd_reflection)
 
-        st.markdown("Feedback for this response")
-        score = st.slider("Score this reply", min_value=0.0, max_value=1.0, value=float(feedback_score_default), step=0.01, key=f"fb_{response_ts}")
-        comment = st.text_input("Optional comment", key=f"fb_comment_{response_ts}")
-        if st.button("Submit feedback for this response", key=f"submit_fb_{response_ts}"):
-            ok = ami.provide_feedback(response_ts, score, outcome_comment=comment)
-            if ok:
-                st.success("Feedback recorded; conservative learning update applied.")
-            else:
-                st.error("Failed to record feedback. See diagnostics.")
+    st.markdown("Feedback for this response")
+    score = st.slider("Score this reply", min_value=0.0, max_value=1.0, value=float(feedback_score_default), step=0.01, key=f"fb_{response_ts}")
+    comment = st.text_input("Optional comment", key=f"fb_comment_{response_ts}")
+    if st.button("Submit feedback for this response", key=f"submit_fb_{response_ts}"):
+        ok = ami.provide_feedback(response_ts, score, outcome_comment=comment)
+        if ok:
+            st.success("Feedback recorded; conservative learning update applied.")
+        else:
+            st.error("Failed to record feedback. See diagnostics.")
 
 # Hidden diagnostics
 with st.expander("Hidden reflections & diagnostics"):
@@ -338,6 +319,6 @@ with st.expander("Hidden reflections & diagnostics"):
 
 st.markdown("---")
 st.caption(
-    "Notes: The UI now sends only the current user message to the agent (conversation context is kept for explainability only) to avoid echoing whole chats into answers. "
-    "Per-message explainability is available via the expander next to each assistant message. Reasoning reflections are safe, post-hoc mappings from numeric AFD metrics — they are NOT chain-of-thought."
+    "Notes: This UI sends only the current user message to the agent; conversation context is kept for explainability only to avoid echoing. "
+    "Reflections are safe, post-hoc summaries derived from numeric AFD metrics and aggregated memory; they are not chain-of-thought."
 )
